@@ -93,62 +93,79 @@ def calculate_stats(data: list) -> dict:
 
 
 # 不同类型的 Tensor 配置，用于测试多种数据类型的序列化性能
-TENSOR_TYPE_CONFIGS = [
-    {"dtype": torch.float32, "bytes_per_elem": 4, "generator": lambda b, s: torch.randn(b, s, dtype=torch.float32)},
-    {"dtype": torch.int64, "bytes_per_elem": 8, "generator": lambda b, s: torch.randint(0, 10000, (b, s), dtype=torch.int64)},
-    {"dtype": torch.float64, "bytes_per_elem": 8, "generator": lambda b, s: torch.randn(b, s, dtype=torch.float64)},
-    {"dtype": torch.int32, "bytes_per_elem": 4, "generator": lambda b, s: torch.randint(0, 10000, (b, s), dtype=torch.int32)},
-    {"dtype": torch.float16, "bytes_per_elem": 2, "generator": lambda b, s: torch.randn(b, s, dtype=torch.float16)},
+DTYPE_CONFIGS = [
+    {"dtype": torch.float32, "bytes_per_elem": 4},
+    {"dtype": torch.int64, "bytes_per_elem": 8},
+    {"dtype": torch.float64, "bytes_per_elem": 8},
+    {"dtype": torch.int32, "bytes_per_elem": 4},
+    {"dtype": torch.float16, "bytes_per_elem": 2},
 ]
 
 
-def create_nested_field(batch_size, total_seq_length, type_config, seed):
+def _generate_regular_tensor(batch_size, seq_length, dtype):
+    """生成普通 Tensor"""
+    if dtype in (torch.int32, torch.int64):
+        return torch.randint(0, 10000, (batch_size, seq_length), dtype=dtype)
+    else:
+        return torch.randn(batch_size, seq_length, dtype=dtype)
+
+
+def _generate_nested_tensor(batch_size, total_elements, dtype):
     """
-    创建一个嵌套的 TensorDict，包含多个随机长度的子 tensor。
-    总数据量 = batch_size * total_seq_length * bytes_per_elem (保持一致)
+    生成 NestedTensor，每个样本的长度随机，但总元素数保持一致。
+    使用 Dirichlet 分布确保随机分配且总和固定。
     """
-    import random
-    random.seed(seed)
+    # 使用 Dirichlet 分布生成随机比例，确保总和为 1
+    proportions = np.random.dirichlet(np.ones(batch_size))
+    lengths = (proportions * total_elements).astype(int)
     
-    # 随机决定子 tensor 数量 (2-4 个)
-    num_nested = random.randint(2, 4)
+    # 修正舍入误差，确保总元素数精确
+    diff = total_elements - lengths.sum()
+    if diff != 0:
+        # 将差值分配给最大的几个元素
+        indices = np.argsort(lengths)[::-1]
+        for i in range(abs(diff)):
+            lengths[indices[i % batch_size]] += 1 if diff > 0 else -1
     
-    # 随机分配 seq_length 给每个子 tensor，确保总和等于 total_seq_length
-    remaining = total_seq_length
-    seq_lengths = []
-    for j in range(num_nested - 1):
-        # 确保至少留 1 给后续 tensor
-        max_len = remaining - (num_nested - 1 - j)
-        min_len = max(1, remaining // (num_nested - j) // 2)
-        length = random.randint(min_len, max(min_len, max_len))
-        seq_lengths.append(length)
-        remaining -= length
-    seq_lengths.append(remaining)  # 最后一个 tensor 拿走剩余的
+    # 确保每个长度至少为 1
+    lengths = np.maximum(lengths, 1)
     
-    nested_fields = {}
-    for j, seq_len in enumerate(seq_lengths):
-        nested_fields[f"nested_{j}"] = type_config["generator"](batch_size, seq_len)
+    # 生成不同长度的 tensor 列表
+    tensors = []
+    for length in lengths:
+        if dtype in (torch.int32, torch.int64):
+            tensors.append(torch.randint(0, 10000, (int(length),), dtype=dtype))
+        else:
+            tensors.append(torch.randn(int(length), dtype=dtype))
     
-    return TensorDict(nested_fields, batch_size=(batch_size,), device=None)
+    return torch.nested.nested_tensor(tensors, dtype=dtype)
 
 
 def create_complex_test_case(batch_size, seq_length, field_num):
     """
-    构造测试数据，使用嵌套的 TensorDict 来测试序列化性能。
-    每个字段是一个嵌套的 TensorDict，包含 2-4 个随机长度的子 tensor。
-    每个字段循环使用不同的数据类型 (float32, int64, float64, int32, float16)。
-    总数据量保持一致：batch_size * seq_length * bytes_per_elem * field_num
+    构造测试数据，使用不同类型的 Tensor 来测试序列化性能。
+    - 偶数字段: 普通 Tensor (float32, int64, float64, int32, float16 轮流)
+    - 奇数字段: NestedTensor (随机长度，但总数据量与普通 Tensor 相同)
     """
     total_size_bytes = 0
     fields = {}
+    total_elements_per_field = batch_size * seq_length
 
     for i in range(field_num):
         field_name = f"field_{i}"
-        type_config = TENSOR_TYPE_CONFIGS[i % len(TENSOR_TYPE_CONFIGS)]
-        # 使用 field index 作为种子，确保可复现
-        nested_td = create_nested_field(batch_size, seq_length, type_config, seed=i)
-        fields[field_name] = nested_td
-        total_size_bytes += batch_size * seq_length * type_config["bytes_per_elem"]
+        dtype_config = DTYPE_CONFIGS[i % len(DTYPE_CONFIGS)]
+        dtype = dtype_config["dtype"]
+        bytes_per_elem = dtype_config["bytes_per_elem"]
+
+        if i % 2 == 0:
+            # 偶数字段: 普通 Tensor
+            tensor_data = _generate_regular_tensor(batch_size, seq_length, dtype)
+        else:
+            # 奇数字段: NestedTensor (随机长度，总元素数相同)
+            tensor_data = _generate_nested_tensor(batch_size, total_elements_per_field, dtype)
+
+        fields[field_name] = tensor_data
+        total_size_bytes += total_elements_per_field * bytes_per_elem
 
     total_size_gb = total_size_bytes / (1024 ** 3)
 
@@ -167,13 +184,39 @@ def remove_placement_group(placement_group):
     ray.util.remove_placement_group(placement_group)
 
 
+def _compare_nested_tensors(original, retrieved, path):
+    """比较两个 NestedTensor 的一致性"""
+    # 解包为列表进行逐个比较
+    orig_tensors = original.unbind()
+    retr_tensors = retrieved.unbind()
+    
+    if len(orig_tensors) != len(retr_tensors):
+        return False, f"[{path}] NestedTensor batch size mismatch: {len(orig_tensors)} vs {len(retr_tensors)}"
+    
+    for idx, (o, r) in enumerate(zip(orig_tensors, retr_tensors)):
+        if o.shape != r.shape:
+            return False, f"[{path}][{idx}] Shape mismatch: {o.shape} vs {r.shape}"
+        if o.dtype != r.dtype:
+            return False, f"[{path}][{idx}] Dtype mismatch: {o.dtype} vs {r.dtype}"
+        if not torch.equal(o.cpu(), r.cpu()):
+            return False, f"[{path}][{idx}] Values mismatch"
+    
+    return True, "Passed"
+
+
 def check_data_consistency(original, retrieved, path="root"):
     """
-    数据一致性校验 (仅支持 TensorDict 及 Tensor)
+    数据一致性校验 (支持 TensorDict、Tensor 及 NestedTensor)
     """
     try:
         if isinstance(original, list) and isinstance(retrieved, LinkedList):
             retrieved = list(retrieved)
+
+        # NestedTensor 检查 (必须在普通 Tensor 之前，因为 NestedTensor 也是 Tensor)
+        if original.is_nested if hasattr(original, 'is_nested') else False:
+            if not (retrieved.is_nested if hasattr(retrieved, 'is_nested') else False):
+                return False, f"[{path}] Type mismatch: NestedTensor vs non-NestedTensor"
+            return _compare_nested_tensors(original, retrieved, path)
 
         if type(original) != type(retrieved):
             return False, f"[{path}] Type mismatch: {type(original)} vs {type(retrieved)}"
