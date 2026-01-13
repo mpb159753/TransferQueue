@@ -102,10 +102,42 @@ TENSOR_TYPE_CONFIGS = [
 ]
 
 
+def create_nested_field(batch_size, total_seq_length, type_config, seed):
+    """
+    创建一个嵌套的 TensorDict，包含多个随机长度的子 tensor。
+    总数据量 = batch_size * total_seq_length * bytes_per_elem (保持一致)
+    """
+    import random
+    random.seed(seed)
+    
+    # 随机决定子 tensor 数量 (2-4 个)
+    num_nested = random.randint(2, 4)
+    
+    # 随机分配 seq_length 给每个子 tensor，确保总和等于 total_seq_length
+    remaining = total_seq_length
+    seq_lengths = []
+    for j in range(num_nested - 1):
+        # 确保至少留 1 给后续 tensor
+        max_len = remaining - (num_nested - 1 - j)
+        min_len = max(1, remaining // (num_nested - j) // 2)
+        length = random.randint(min_len, max(min_len, max_len))
+        seq_lengths.append(length)
+        remaining -= length
+    seq_lengths.append(remaining)  # 最后一个 tensor 拿走剩余的
+    
+    nested_fields = {}
+    for j, seq_len in enumerate(seq_lengths):
+        nested_fields[f"nested_{j}"] = type_config["generator"](batch_size, seq_len)
+    
+    return TensorDict(nested_fields, batch_size=(batch_size,), device=None)
+
+
 def create_complex_test_case(batch_size, seq_length, field_num):
     """
-    构造测试数据，使用不同类型的 Tensor 来测试序列化性能。
-    每个字段会循环使用不同的数据类型 (float32, int64, float64, int32, float16)。
+    构造测试数据，使用嵌套的 TensorDict 来测试序列化性能。
+    每个字段是一个嵌套的 TensorDict，包含 2-4 个随机长度的子 tensor。
+    每个字段循环使用不同的数据类型 (float32, int64, float64, int32, float16)。
+    总数据量保持一致：batch_size * seq_length * bytes_per_elem * field_num
     """
     total_size_bytes = 0
     fields = {}
@@ -113,8 +145,9 @@ def create_complex_test_case(batch_size, seq_length, field_num):
     for i in range(field_num):
         field_name = f"field_{i}"
         type_config = TENSOR_TYPE_CONFIGS[i % len(TENSOR_TYPE_CONFIGS)]
-        tensor_data = type_config["generator"](batch_size, seq_length)
-        fields[field_name] = tensor_data
+        # 使用 field index 作为种子，确保可复现
+        nested_td = create_nested_field(batch_size, seq_length, type_config, seed=i)
+        fields[field_name] = nested_td
         total_size_bytes += batch_size * seq_length * type_config["bytes_per_elem"]
 
     total_size_gb = total_size_bytes / (1024 ** 3)
