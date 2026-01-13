@@ -122,7 +122,7 @@ class ZMQMessage:
     request_id: str
     timestamp: float
 
-    # 仅在序列化/反序列化过程中使用的临时容器，不需要在构造时传入
+    # Temporary container used only during serialization/deserialization, no need to pass in during construction
     _buffers: list = field(default_factory=list, repr=False)
 
     @classmethod
@@ -144,51 +144,51 @@ class ZMQMessage:
 
     def serialize(self) -> list[bytestr]:
         """
-        将消息序列化为 ZMQ Multipart 帧列表。
-        Frame 0: Pickled Header (包含结构树和非 Tensor 数据)
+        Serialize message into a ZMQ Multipart frame list.
+        Frame 0: Pickled Header (contains structure tree and non-Tensor data)
         Frame 1...N: Raw Tensor Buffers
         """
         self._buffers = []
 
-        # 1. 提取所有 Tensor 到 self._buffers，并将 body 转换为轻量级结构
+        # 1. Extract all Tensors to self._buffers and convert body to lightweight structure
         packed_body = _pack_data(self.body, self._buffers)
 
-        # 2. 构建 Header
+        # 2. Build Header
         header = {
             "request_type": self.request_type,
             "sender_id": self.sender_id,
             "receiver_id": self.receiver_id,
             "request_id": self.request_id,
             "timestamp": self.timestamp,
-            "body_structure": packed_body,  # 仅包含结构和元数据
+            "body_structure": packed_body,  # Contains only structure and metadata
         }
 
-        # 3. 序列化 Header
+        # 3. Serialize Header
         header_bytes = pickle.dumps(header)
 
-        # 4. 组装最终发送列表：[Header, Buffer_0, Buffer_1, ...]
+        # 4. Assemble final send list: [Header, Buffer_0, Buffer_1, ...]
         return [header_bytes, *self._buffers]
 
     @classmethod
     def deserialize(cls, frames: list[bytestr]) -> "ZMQMessage":
         """
-        从 ZMQ Multipart 帧列表反序列化消息。
+        Deserialize message from a ZMQ Multipart frame list.
         """
         if not frames:
             raise ValueError("Empty frames received")
 
-        # 1. 解析 Header
+        # 1. Parse Header
         header_bytes = frames[0]
         header = pickle.loads(header_bytes)
 
-        # 2. 获取数据帧 (Frames 1...N)
+        # 2. Get data frames (Frames 1...N)
         raw_buffers = frames[1:]
 
-        # 3. 递归重构 Body (Zero-Copy)
+        # 3. Recursively reconstruct Body (Zero-Copy)
         body_structure = header["body_structure"]
         restored_body = _unpack_data(body_structure, raw_buffers)
 
-        # 4. 构建对象
+        # 4. Build object
         msg = cls(
             request_type=header["request_type"],
             sender_id=header["sender_id"],

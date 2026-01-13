@@ -16,7 +16,7 @@
 
 # This implementation is inspired by https://github.com/vllm-project/vllm/blob/main/vllm/v1/serial_utils.py
 
-import itertools
+
 import logging
 import os
 import pickle
@@ -31,13 +31,10 @@ import torch
 import zmq
 from msgspec import msgpack
 
-from transfer_queue.utils.utils import get_env_bool
 
 CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_RAW_VIEW = 3
-
-TQ_ZERO_COPY_SERIALIZATION = get_env_bool("TQ_ZERO_COPY_SERIALIZATION", default=False) and HAS_RPC_PICKLER
 
 bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
 tensorenc = tuple[str, tuple[int, ...], int | memoryview]
@@ -168,116 +165,11 @@ class MsgpackDecoder:
 _encoder = MsgpackEncoder()
 _decoder = MsgpackDecoder(torch.Tensor)
 
-
-# Process tensors and collect nested tensor info efficiently
-def _process_tensor(tensor: torch.Tensor) -> Any:
-    if tensor.is_nested and tensor.layout == torch.strided:
-        tensor_list = tensor.unbind()
-        tensor_count = len(tensor_list)
-        serialized_tensors = [_encoder.encode(inner_tensor) for inner_tensor in tensor_list]
-        return tensor_count, serialized_tensors  # tensor_count may equal to 1 for single nested tensor
-    else:
-        return -1, [_encoder.encode(tensor)]  # use -1 to indicate regular single tensor
-
-
-def serialization(obj: Any) -> list[bytestr]:
-    """
-    Serializes any object.
-
-    Returns:
-        list[bytestr]: If TQ_ZERO_COPY_SERIALIZATION is enabled, returns a list where the first element
-        is the pickled bytes of the message, followed by the flattened serialized tensor parts as
-        [pickled_bytes, <bytes>, |<bytes>, <memoryview>, |<bytes>, <memoryview>|...].
-        From the third element, two elements is a group that will be used to restore a tensor.
-
-        If TQ_ZERO_COPY_SERIALIZATION is disabled, returns a single-element list containing only the pickled bytes
-        through pickle.
-    """
-
-    logger.debug(f"Serializing an obj with TQ_ZERO_COPY_SERIALIZATION={TQ_ZERO_COPY_SERIALIZATION}")
-
-    if TQ_ZERO_COPY_SERIALIZATION:
-        pickled_bytes, tensors = _internal_rpc_pickler.serialize(obj)
-
-        # Use map to process all tensors in parallel-like fashion
-        nested_tensor_info_and_serialized_tensors = list(map(_process_tensor, tensors))
-
-        # Extract nested_tensor_info and flatten serialized tensors using itertools
-        nested_tensor_info = np.array([info for info, _ in nested_tensor_info_and_serialized_tensors])
-        double_layer_serialized_tensors: list[list[bytestr]] = list(
-            itertools.chain.from_iterable(serialized for _, serialized in nested_tensor_info_and_serialized_tensors)
-        )
-        serialized_tensors: list[bytestr] = list(itertools.chain.from_iterable(double_layer_serialized_tensors))
-        return [pickled_bytes, pickle.dumps(nested_tensor_info), *serialized_tensors]
-    else:
-        return [pickle.dumps(obj)]
-
-
-def deserialization(data: list[bytestr] | bytestr) -> Any:
-    """Deserialize any object from serialized data."""
-
-    logger.debug(f"Deserializing an obj with TQ_ZERO_COPY_SERIALIZATION={TQ_ZERO_COPY_SERIALIZATION}")
-
-    if TQ_ZERO_COPY_SERIALIZATION:
-        if isinstance(data, list):
-            # contain tensors
-            pickled_bytes = data[0]
-            nested_tensor_info = pickle.loads(data[1])
-            serialized_tensors = data[2:]
-            if len(serialized_tensors) % 2 != 0:
-                # Note: data is a list of [pickled_bytes, <bytes>, |<bytes>, <memoryview>,
-                # |<bytes>, <memoryview>|...].
-                # From the third element, two elements is a group that will be used to restore a tensor.
-
-                raise ValueError(
-                    f"When TQ_ZERO_COPY_SERIALIZATION is enabled, input data should "
-                    f"be a list containing an even number of elements, but got {len(data)}."
-                )
-            # deserializing each single tensor
-            single_tensors: list[torch.Tensor] = [
-                _decoder.decode(pair) for pair in zip(serialized_tensors[::2], serialized_tensors[1::2], strict=False)
-            ]
-        else:
-            raise ValueError(
-                f"When TQ_ZERO_COPY_SERIALIZATION is enabled, input data should be a list, but got {type(data)}."
-            )
-
-        tensor_nums = np.abs(nested_tensor_info).sum()
-        if tensor_nums != len(single_tensors):
-            raise ValueError(f"Expecting {tensor_nums} tensors, but got {len(single_tensors)}.")
-
-        tensors = [None] * len(nested_tensor_info)
-        current_idx = 0
-        for i, tensor_num in enumerate(nested_tensor_info):
-            if tensor_num == -1:
-                tensors[i] = single_tensors[current_idx]
-                current_idx += 1
-            else:
-                tensors[i] = torch.nested.as_nested_tensor(single_tensors[current_idx : current_idx + tensor_num])
-                current_idx += tensor_num
-
-        return _internal_rpc_pickler.deserialize(pickled_bytes, tensors)
-    else:
-        if isinstance(data, bytestr):
-            return pickle.loads(data)
-        elif isinstance(data, list):
-            if len(data) > 1:
-                raise ValueError(
-                    f"When TQ_ZERO_COPY_SERIALIZATION is disabled, must have only 1 element in"
-                    f" list for deserialization, but got {len(data)}."
-                )
-            return pickle.loads(data[0])
-        else:
-            raise ValueError(
-                f"When TQ_ZERO_COPY_SERIALIZATION is disabled, input data should be a list of bytestr,"
-                f" but got {type(data)}."
-            )
-
 def _pack_data(data: Any, buffers: list[memoryview]) -> Any:
     """
-    递归遍历数据结构。
-    1. 将所有 Tensor 提取为 buffer 并存入 buffers 列表。
-    2. 在原数据结构位置替换为元数据描述符（占位符）。
+    Recursively traverse the data structure.
+    1. Extract all Tensors as buffers and store them in the buffers list.
+    2. Replace the original data structure position with metadata descriptors (placeholders).
     """
     if isinstance(data, torch.Tensor):
         if not data.is_contiguous():
@@ -286,16 +178,16 @@ def _pack_data(data: Any, buffers: list[memoryview]) -> Any:
         if data.device.type != 'cpu':
             data = data.cpu()
 
-        # 记录元数据
+        # Record metadata
         meta = {
             META_KEY: "tensor",
-            # 获取 buffer 长度, 作为当前片段的 idx
+            # Get buffer length as the idx for the current segment
             "idx": len(buffers),
             "dtype": data.dtype,
             "shape": data.shape,
         }
 
-        # 获取零拷贝视图
+        # Get zero-copy view
         buf = memoryview(data.numpy())
         buffers.append(buf)
         return meta
@@ -319,16 +211,16 @@ def _pack_data(data: Any, buffers: list[memoryview]) -> Any:
     elif isinstance(data, tuple):
         return tuple(_pack_data(v, buffers) for v in data)
 
-    # 其他类型直接返回 (将在 Header 中被 pickle)
+    # Return other types directly (will be pickled in Header)
     return data
 
 
 def _unpack_data(data: Any, buffers: list[bytestr]) -> Any:
     """
-    递归还原数据结构。
+    Recursively restore the data structure.
     """
     if isinstance(data, dict):
-        # 检查是否是特殊元数据包
+        # Check if this is a special metadata packet
         if META_KEY in data:
             obj_type = data[META_KEY]
             idx = data["idx"]
@@ -344,9 +236,9 @@ def _unpack_data(data: Any, buffers: list[bytestr]) -> Any:
 
             # Case B: Bytes
             elif obj_type == "bytes":
-                # 将 memoryview 转回 bytes
-                # 注意：如果用户能接受 memoryview，直接返回 raw_buffer 性能最好
-                # 这里为了兼容性转为 bytes (可能发生拷贝，取决于具体实现)
+                # Convert memoryview back to bytes
+                # Note: Returning raw_buffer directly would be best for performance if user can accept memoryview
+                # Here we convert to bytes for compatibility (may involve copying, depending on implementation)
                 return bytes(raw_buffer)
 
             # Case C: String
@@ -355,7 +247,7 @@ def _unpack_data(data: Any, buffers: list[bytestr]) -> Any:
                 # Decode bytes -> str
                 return bytes(raw_buffer).decode(encoding)
 
-        # 常规字典递归
+        # Regular dict recursion
         return {k: _unpack_data(v, buffers) for k, v in data.items()}
 
     elif isinstance(data, list):
