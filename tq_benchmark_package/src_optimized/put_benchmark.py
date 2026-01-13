@@ -265,10 +265,11 @@ def sync_stage(flag_to_create, flag_to_wait):
 # -----------------------------
 
 class TQBandwidthTester:
-    def __init__(self, target_ip=None, storage_units=8):
+    def __init__(self, target_ip=None, storage_units=8, enable_profile=False):
         self.target_ip = target_ip
         self.num_storage_units = storage_units
         self.remote_mode = target_ip is not None
+        self.enable_profile = enable_profile
         self.data_system_client = None
         self.tq_config = None
         self.data_system_controller = None
@@ -383,10 +384,12 @@ class TQBandwidthTester:
 
             # --- PUT ---
             start_put = time.time()
-            if i == 0: sync_stage('init_ready.flag', 'put_start.flag')
+            if i == 0 and self.enable_profile:
+                sync_stage('init_ready.flag', 'put_start.flag')
             asyncio.run(self.data_system_client.async_put(data=big_input_ids, partition_id=partition_key))
             put_time = time.time() - start_put
-            if i == 0: sync_stage('put_done.flag', 'get_prepare.flag')
+            if i == 0 and self.enable_profile:
+                sync_stage('put_done.flag', 'get_prepare.flag')
 
             put_gbps = (total_gb * 8) / put_time
             put_speeds.append(put_gbps)
@@ -402,7 +405,8 @@ class TQBandwidthTester:
 
             # --- GET DATA ---
             start_get = time.time()
-            if i == 0: sync_stage('get_ready.flag', 'get_start.flag')
+            if i == 0 and self.enable_profile:
+                sync_stage('get_ready.flag', 'get_start.flag')
             retrieved_data = asyncio.run(self.data_system_client.async_get_data(prompt_meta))
             get_time = time.time() - start_get
 
@@ -444,8 +448,9 @@ def main():
     parser.add_argument("--config", type=str, default=None, choices=list(CONFIG_MAP.keys()),
                         help="Specific config to run.")
     parser.add_argument("--output", type=str, default="tq_benchmark_result.json", help="Output JSON file.")
-    parser.add_argument("--rounds", type=int, default=20, help="Test rounds per config (default: 10)")
+    parser.add_argument("--rounds", type=int, default=20, help="Test rounds per config (default: 20)")
     parser.add_argument("--shards", type=int, default=8, help="Number of storage units (default: 8)")
+    parser.add_argument("--profile", action="store_true", help="Enable profile sync (requires external profiler)")
 
     args = parser.parse_args()
 
@@ -460,7 +465,7 @@ def main():
     logger.info(f"Ray Initialized. Remote Target: {args.ip if args.ip else 'Local'}")
 
     # 2. Setup Tester
-    tester = TQBandwidthTester(target_ip=args.ip, storage_units=args.shards)
+    tester = TQBandwidthTester(target_ip=args.ip, storage_units=args.shards, enable_profile=args.profile)
 
     # 3. Execution Loop
     run_list = [args.config] if args.config else list(CONFIG_MAP.keys())

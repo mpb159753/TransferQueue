@@ -1,0 +1,317 @@
+[
+    {
+        "scenario": "TransferQueue",
+        "config": "debug",
+        "rounds": 10,
+        "shards": 8,
+        "cpu_limit": 30.0,
+        "cpuset_used": "2-31",
+        "timestamp": "2026-01-08T16:26:31.097624",
+        "resource_usage": {
+            "max_cpu_percent": 1781.21,
+            "avg_cpu_percent": 302.416,
+            "max_mem_mb": 9089.024,
+            "avg_mem_mb": 6346.42132875,
+            "cpu_seconds": 144.7297357072353,
+            "duration_seconds": 47.7637243270874
+        },
+        "performance_data": [
+            {
+                "scenario": "TransferQueue",
+                "setting": "debug (Local)",
+                "data_volume": "0.05 MB",
+                "operation": "PUT",
+                "payload_gb": 4.57763671875e-05,
+                "stats_gbps": {
+                    "mean": 0.004709527619665975,
+                    "max": 0.0054926192928252664,
+                    "min": 0.0028215014575920616,
+                    "p99": 0.0054683821057762505
+                }
+            },
+            {
+                "scenario": "TransferQueue",
+                "setting": "debug (Local)",
+                "data_volume": "0.05 MB",
+                "operation": "GET",
+                "payload_gb": 4.57763671875e-05,
+                "stats_gbps": {
+                    "mean": 0.005625220698054979,
+                    "max": 0.006318205563805238,
+                    "min": 0.0049212156940644245,
+                    "p99": 0.00631022603202455
+                }
+            }
+        ]
+    },
+    {
+        "scenario": "TransferQueue",
+        "config": "tiny",
+        "rounds": 10,
+        "shards": 8,
+        "cpu_limit": 30.0,
+        "cpuset_used": "2-31",
+        "timestamp": "2026-01-08T16:27:23.388173",
+        "resource_usage": {
+            "max_cpu_percent": 1521.41,
+            "avg_cpu_percent": 287.20279999999997,
+            "max_mem_mb": 9114.624,
+            "avg_mem_mb": 6423.76216,
+            "cpu_seconds": 137.34941735703947,
+            "duration_seconds": 47.77908420562744
+        },
+        "performance_data": [
+            {
+                "scenario": "TransferQueue",
+                "setting": "tiny (Local)",
+                "data_volume": "0.62 MB",
+                "operation": "PUT",
+                "payload_gb": 0.0006103515625,
+                "stats_gbps": {
+                    "mean": 0.05768796816030832,
+                    "max": 0.07006763853583269,
+                    "min": 0.03632442249843919,
+                    "p99": 0.06981656258172197
+                }
+            },
+            {
+                "scenario": "TransferQueue",
+                "setting": "tiny (Local)",
+                "data_volume": "0.62 MB",
+                "operation": "GET",
+                "payload_gb": 0.0006103515625,
+                "stats_gbps": {
+                    "mean": 0.05858600638145499,
+                    "max": 0.06837173122698546,
+                    "min": 0.05043552355176414,
+                    "p99": 0.06834674994774444
+                }
+            }
+        ]
+    },
+    {
+        "scenario": "TransferQueue",
+        "config": "small",
+        "rounds": 10,
+        "shards": 8,
+        "cpu_limit": 30.0,
+        "cpuset_used": "2-31",
+        "timestamp": "2026-01-08T16:28:23.056751",
+        "resource_usage": {
+            "max_cpu_percent": 1755.32,
+            "avg_cpu_percent": 291.1457142857143,
+            "max_mem_mb": 9751.552,
+            "avg_mem_mb": 7263.827928571429,
+            "cpu_seconds": 156.56852850039004,
+            "duration_seconds": 53.76955699920654
+        },
+        "performance_data": [
+            {
+                "scenario": "TransferQueue",
+                "setting": "small (Local)",
+                "data_volume": "0.0498 GB",
+                "operation": "PUT",
+                "payload_gb": 0.0498046875,
+                "stats_gbps": {
+                    "mean": 0.8931320676032739,
+                    "max": 1.0032754761927631,
+                    "min": 0.6845315117040663,
+                    "p99": 1.0027159078060455
+                }
+            },
+            {
+                "scenario": "TransferQueue",
+                "setting": "small (Local)",
+                "data_volume": "0.0498 GB",
+                "operation": "GET",
+                "payload_gb": 0.0498046875,
+                "stats_gbps": {
+                    "mean": 1.1712139552533003,
+                    "max": 1.212887099618752,
+                    "min": 1.1439735221738103,
+                    "p99": 1.2108808897887402
+                }
+            }
+        ]
+    },
+    {
+        "scenario": "TransferQueue",
+        "config": "medium",
+        "rounds": 10,
+        "shards": 8,
+        "cpu_limit": 30.0,
+        "cpuset_used": "2-31",
+        "timestamp": "2026-01-08T16:29:44.498770",
+        "resource_usage": {
+            "max_cpu_percent": 1400.94,
+            "avg_cpu_percent": 279.5576923076923,
+            "max_mem_mb": 12666.88,
+            "avg_mem_mb": 9502.17482051282,
+            "cpu_seconds": 211.89119806494713,
+            "duration_seconds": 75.90101313591003
+        },
+        "performance_data": [
+            {
+                "scenario": "TransferQueue",
+                "setting": "medium (Local)",
+                "data_volume": "0.5020 GB",
+                "operation": "PUT",
+                "payload_gb": 0.501953125,
+                "stats_gbps": {
+                    "mean": 2.9059336904035686,
+                    "max": 3.294890487245243,
+                    "min": 2.4098261345579277,
+                    "p99": 3.2886613099385564
+                }
+            },
+            {
+                "scenario": "TransferQueue",
+                "setting": "medium (Local)",
+                "data_volume": "0.5020 GB",
+                "operation": "GET",
+                "payload_gb": 0.501953125,
+                "stats_gbps": {
+                    "mean": 3.341128004846291,
+                    "max": 3.5677008908050967,
+                    "min": 3.030369088664655,
+                    "p99": 3.564805038008242
+                }
+            }
+        ]
+    },
+    {
+        "scenario": "TransferQueue",
+        "config": "large",
+        "rounds": 10,
+        "shards": 8,
+        "cpu_limit": 30.0,
+        "cpuset_used": "2-31",
+        "timestamp": "2026-01-08T16:32:54.795986",
+        "resource_usage": {
+            "max_cpu_percent": 1546.92,
+            "avg_cpu_percent": 274.66655913978497,
+            "max_mem_mb": 30238.72,
+            "avg_mem_mb": 21654.085139784947,
+            "cpu_seconds": 506.09077491979593,
+            "duration_seconds": 184.44691491127014
+        },
+        "performance_data": [
+            {
+                "scenario": "TransferQueue",
+                "setting": "large (Local)",
+                "data_volume": "2.9336 GB",
+                "operation": "PUT",
+                "payload_gb": 2.93359375,
+                "stats_gbps": {
+                    "mean": 4.133168595759391,
+                    "max": 4.578504917720464,
+                    "min": 3.26515857925055,
+                    "p99": 4.563900350215015
+                }
+            },
+            {
+                "scenario": "TransferQueue",
+                "setting": "large (Local)",
+                "data_volume": "2.9336 GB",
+                "operation": "GET",
+                "payload_gb": 2.93359375,
+                "stats_gbps": {
+                    "mean": 4.376089362597884,
+                    "max": 4.704218763814317,
+                    "min": 3.8667818326635133,
+                    "p99": 4.703589169757455
+                }
+            }
+        ]
+    },
+    {
+        "scenario": "TransferQueue",
+        "config": "xlarge",
+        "rounds": 10,
+        "shards": 8,
+        "cpu_limit": 30.0,
+        "cpuset_used": "2-31",
+        "timestamp": "2026-01-08T16:38:07.681762",
+        "resource_usage": {
+            "max_cpu_percent": 1734.16,
+            "avg_cpu_percent": 285.97785714285715,
+            "max_mem_mb": 51312.64,
+            "avg_mem_mb": 36762.82792207792,
+            "cpu_seconds": 877.8911032675023,
+            "duration_seconds": 307.04825615882874
+        },
+        "performance_data": [
+            {
+                "scenario": "TransferQueue",
+                "setting": "xlarge (Local)",
+                "data_volume": "5.8672 GB",
+                "operation": "PUT",
+                "payload_gb": 5.8671875,
+                "stats_gbps": {
+                    "mean": 4.273568046754548,
+                    "max": 4.592019078079429,
+                    "min": 3.439755677060381,
+                    "p99": 4.589199293534917
+                }
+            },
+            {
+                "scenario": "TransferQueue",
+                "setting": "xlarge (Local)",
+                "data_volume": "5.8672 GB",
+                "operation": "GET",
+                "payload_gb": 5.8671875,
+                "stats_gbps": {
+                    "mean": 4.544964124996089,
+                    "max": 4.80688819958277,
+                    "min": 4.27480596190707,
+                    "p99": 4.799685270249665
+                }
+            }
+        ]
+    },
+    {
+        "scenario": "TransferQueue",
+        "config": "huge",
+        "rounds": 10,
+        "shards": 8,
+        "cpu_limit": 30.0,
+        "cpuset_used": "2-31",
+        "timestamp": "2026-01-08T16:46:28.643536",
+        "resource_usage": {
+            "max_cpu_percent": 1642.25,
+            "avg_cpu_percent": 291.67951612903227,
+            "max_mem_mb": 79564.8,
+            "avg_mem_mb": 57134.70460483871,
+            "cpu_seconds": 1446.6934646433826,
+            "duration_seconds": 495.9471740722656
+        },
+        "performance_data": [
+            {
+                "scenario": "TransferQueue",
+                "setting": "huge (Local)",
+                "data_volume": "9.7852 GB",
+                "operation": "PUT",
+                "payload_gb": 9.78515625,
+                "stats_gbps": {
+                    "mean": 4.188713785096335,
+                    "max": 4.4207166969775615,
+                    "min": 3.3813117221818842,
+                    "p99": 4.4139963895870835
+                }
+            },
+            {
+                "scenario": "TransferQueue",
+                "setting": "huge (Local)",
+                "data_volume": "9.7852 GB",
+                "operation": "GET",
+                "payload_gb": 9.78515625,
+                "stats_gbps": {
+                    "mean": 4.31800684749673,
+                    "max": 4.6351432566648665,
+                    "min": 4.023076025595624,
+                    "p99": 4.633846801656212
+                }
+            }
+        ]
+    }
+]

@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import random
 import sys
 import time
 import numpy as np
@@ -12,6 +13,7 @@ import torch
 from pathlib import Path
 from omegaconf import OmegaConf
 from tensordict import TensorDict
+from tensordict.tensorclass import NonTensorData
 from tensordict.utils import LinkedList
 
 # 添加路径以确保能引用 transfer_queue
@@ -92,82 +94,34 @@ def calculate_stats(data: list) -> dict:
     }
 
 
-# 不同类型的 Tensor 配置，用于测试多种数据类型的序列化性能
-DTYPE_CONFIGS = [
-    {"dtype": torch.float32, "bytes_per_elem": 4},
-    {"dtype": torch.int64, "bytes_per_elem": 8},
-    {"dtype": torch.float64, "bytes_per_elem": 8},
-    {"dtype": torch.int32, "bytes_per_elem": 4},
-    {"dtype": torch.float16, "bytes_per_elem": 2},
-]
-
-
-def _generate_regular_tensor(batch_size, seq_length, dtype):
-    """生成普通 Tensor"""
-    if dtype in (torch.int32, torch.int64):
-        return torch.randint(0, 10000, (batch_size, seq_length), dtype=dtype)
-    else:
-        return torch.randn(batch_size, seq_length, dtype=dtype)
-
-
-def _generate_nested_tensor(batch_size, total_elements, dtype):
-    """
-    生成 NestedTensor，每个样本的长度随机，但总元素数保持一致。
-    使用 Dirichlet 分布确保随机分配且总和固定。
-    """
-    # 使用 Dirichlet 分布生成随机比例，确保总和为 1
-    proportions = np.random.dirichlet(np.ones(batch_size))
-    lengths = (proportions * total_elements).astype(int)
-    
-    # 修正舍入误差，确保总元素数精确
-    diff = total_elements - lengths.sum()
-    if diff != 0:
-        # 将差值分配给最大的几个元素
-        indices = np.argsort(lengths)[::-1]
-        for i in range(abs(diff)):
-            lengths[indices[i % batch_size]] += 1 if diff > 0 else -1
-    
-    # 确保每个长度至少为 1
-    lengths = np.maximum(lengths, 1)
-    
-    # 生成不同长度的 tensor 列表
-    tensors = []
-    for length in lengths:
-        if dtype in (torch.int32, torch.int64):
-            tensors.append(torch.randint(0, 10000, (int(length),), dtype=dtype))
-        else:
-            tensors.append(torch.randn(int(length), dtype=dtype))
-    
-    return torch.nested.nested_tensor(tensors, dtype=dtype)
-
-
 def create_complex_test_case(batch_size, seq_length, field_num):
     """
-    构造测试数据，使用不同类型的 Tensor 来测试序列化性能。
-    - 偶数字段: 普通 Tensor (float32, int64, float64, int32, float16 轮流)
-    - 奇数字段: NestedTensor (随机长度，但总数据量与普通 Tensor 相同)
+    构造测试数据，计算准确的大小
     """
-    total_size_bytes = 0
-    fields = {}
-    total_elements_per_field = batch_size * seq_length
+    tensor_field_size_bytes = batch_size * seq_length * 4
+    tensor_field_size_gb = tensor_field_size_bytes / (1024 ** 3)
 
+    num_tensor_fields = (field_num + 1) // 2
+    num_nontensor_fields = field_num // 2
+
+    total_tensor_size_gb = tensor_field_size_gb * num_tensor_fields
+    # 估算 String NonTensorData 大小 (假设 1024 bytes per sample)
+    str_len = 1024
+    total_nontensor_size_gb = (batch_size * str_len / (1024 ** 3)) * num_nontensor_fields
+    total_size_gb = total_tensor_size_gb + total_nontensor_size_gb
+
+    fields = {}
     for i in range(field_num):
         field_name = f"field_{i}"
-        dtype_config = DTYPE_CONFIGS[i % len(DTYPE_CONFIGS)]
-        dtype = dtype_config["dtype"]
-        bytes_per_elem = dtype_config["bytes_per_elem"]
-
         if i % 2 == 0:
-            # 偶数字段: 普通 Tensor
-            tensor_data = _generate_regular_tensor(batch_size, seq_length, dtype)
+            tensor_data = torch.randn(batch_size, seq_length, dtype=torch.float32)
+            fields[field_name] = tensor_data
         else:
-            # 奇数字段: NestedTensor (随机长度，总元素数相同)
-            tensor_data = _generate_nested_tensor(batch_size, total_elements_per_field, dtype)
-
-        fields[field_name] = tensor_data
-        total_size_bytes += total_elements_per_field * bytes_per_elem
-
-    total_size_gb = total_size_bytes / (1024 ** 3)
+            non_tensor_data = [
+                ''.join(random.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=str_len))
+                for _ in range(batch_size)
+            ]
+            fields[field_name] = NonTensorData(data=non_tensor_data, batch_size=(batch_size,), device=None)
 
     prompt_batch = TensorDict(
         fields,
@@ -184,39 +138,13 @@ def remove_placement_group(placement_group):
     ray.util.remove_placement_group(placement_group)
 
 
-def _compare_nested_tensors(original, retrieved, path):
-    """比较两个 NestedTensor 的一致性"""
-    # 解包为列表进行逐个比较
-    orig_tensors = original.unbind()
-    retr_tensors = retrieved.unbind()
-    
-    if len(orig_tensors) != len(retr_tensors):
-        return False, f"[{path}] NestedTensor batch size mismatch: {len(orig_tensors)} vs {len(retr_tensors)}"
-    
-    for idx, (o, r) in enumerate(zip(orig_tensors, retr_tensors)):
-        if o.shape != r.shape:
-            return False, f"[{path}][{idx}] Shape mismatch: {o.shape} vs {r.shape}"
-        if o.dtype != r.dtype:
-            return False, f"[{path}][{idx}] Dtype mismatch: {o.dtype} vs {r.dtype}"
-        if not torch.equal(o.cpu(), r.cpu()):
-            return False, f"[{path}][{idx}] Values mismatch"
-    
-    return True, "Passed"
-
-
 def check_data_consistency(original, retrieved, path="root"):
     """
-    数据一致性校验 (支持 TensorDict、Tensor 及 NestedTensor)
+    数据一致性校验
     """
     try:
         if isinstance(original, list) and isinstance(retrieved, LinkedList):
             retrieved = list(retrieved)
-
-        # NestedTensor 检查 (必须在普通 Tensor 之前，因为 NestedTensor 也是 Tensor)
-        if original.is_nested if hasattr(original, 'is_nested') else False:
-            if not (retrieved.is_nested if hasattr(retrieved, 'is_nested') else False):
-                return False, f"[{path}] Type mismatch: NestedTensor vs non-NestedTensor"
-            return _compare_nested_tensors(original, retrieved, path)
 
         if type(original) != type(retrieved):
             return False, f"[{path}] Type mismatch: {type(original)} vs {type(retrieved)}"
@@ -233,12 +161,15 @@ def check_data_consistency(original, retrieved, path="root"):
         elif isinstance(original, torch.Tensor):
             if original.shape != retrieved.shape:
                 return False, f"[{path}] Tensor shape mismatch: {original.shape} vs {retrieved.shape}"
-            if original.dtype != retrieved.dtype:
-                return False, f"[{path}] Tensor dtype mismatch: {original.dtype} vs {retrieved.dtype}"
             t1 = original.cpu()
             t2 = retrieved.cpu()
             if not torch.equal(t1, t2):
                 return False, f"[{path}] Tensor values mismatch"
+            return True, "Passed"
+
+        elif 'NonTensorData' in str(type(original)):
+            if original.data != retrieved.data:
+                return False, f"[{path}] NonTensorData content mismatch"
             return True, "Passed"
 
         else:
@@ -253,23 +184,11 @@ def check_data_consistency(original, retrieved, path="root"):
 # =========================================================
 # [Core Tester Class]
 # =========================================================
-
-# --- Profiling Hook Helper ---
-import os
-import time
-def sync_stage(flag_to_create, flag_to_wait):
-    with open(flag_to_create, 'w') as f: f.write('1')
-    while not os.path.exists(flag_to_wait): time.sleep(0.05)
-    try: os.remove(flag_to_wait)
-    except: pass
-# -----------------------------
-
 class TQBandwidthTester:
-    def __init__(self, target_ip=None, storage_units=8, enable_profile=False):
+    def __init__(self, target_ip=None, storage_units=8):
         self.target_ip = target_ip
         self.num_storage_units = storage_units
         self.remote_mode = target_ip is not None
-        self.enable_profile = enable_profile
         self.data_system_client = None
         self.tq_config = None
         self.data_system_controller = None
@@ -384,12 +303,8 @@ class TQBandwidthTester:
 
             # --- PUT ---
             start_put = time.time()
-            if i == 0 and self.enable_profile:
-                sync_stage('init_ready.flag', 'put_start.flag')
             asyncio.run(self.data_system_client.async_put(data=big_input_ids, partition_id=partition_key))
             put_time = time.time() - start_put
-            if i == 0 and self.enable_profile:
-                sync_stage('put_done.flag', 'get_prepare.flag')
 
             put_gbps = (total_gb * 8) / put_time
             put_speeds.append(put_gbps)
@@ -405,8 +320,6 @@ class TQBandwidthTester:
 
             # --- GET DATA ---
             start_get = time.time()
-            if i == 0 and self.enable_profile:
-                sync_stage('get_ready.flag', 'get_start.flag')
             retrieved_data = asyncio.run(self.data_system_client.async_get_data(prompt_meta))
             get_time = time.time() - start_get
 
@@ -448,9 +361,8 @@ def main():
     parser.add_argument("--config", type=str, default=None, choices=list(CONFIG_MAP.keys()),
                         help="Specific config to run.")
     parser.add_argument("--output", type=str, default="tq_benchmark_result.json", help="Output JSON file.")
-    parser.add_argument("--rounds", type=int, default=20, help="Test rounds per config (default: 20)")
+    parser.add_argument("--rounds", type=int, default=20, help="Test rounds per config (default: 10)")
     parser.add_argument("--shards", type=int, default=8, help="Number of storage units (default: 8)")
-    parser.add_argument("--profile", action="store_true", help="Enable profile sync (requires external profiler)")
 
     args = parser.parse_args()
 
@@ -465,7 +377,7 @@ def main():
     logger.info(f"Ray Initialized. Remote Target: {args.ip if args.ip else 'Local'}")
 
     # 2. Setup Tester
-    tester = TQBandwidthTester(target_ip=args.ip, storage_units=args.shards, enable_profile=args.profile)
+    tester = TQBandwidthTester(target_ip=args.ip, storage_units=args.shards)
 
     # 3. Execution Loop
     run_list = [args.config] if args.config else list(CONFIG_MAP.keys())
@@ -502,9 +414,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        from transfer_queue.utils import serial_utils
-        print(f'[Benchmark Startup Check] TQ_ZERO_COPY_SERIALIZATION = {serial_utils.TQ_ZERO_COPY_SERIALIZATION}')
-    except ImportError:
-        print('[Benchmark Startup Check] Could not import serial_utils to check flag.')
     main()
