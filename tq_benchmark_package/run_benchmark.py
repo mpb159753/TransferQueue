@@ -91,6 +91,12 @@ def run_single_benchmark(scenario, config_name, run_id, rounds, shards, cpu_limi
     container_name = f"bench_{run_id}_{int(time.time())}"
     source_path = os.path.abspath(branch_config["path"])
     cpuset_str = get_cpuset_range(cpu_limit)
+    result_file = os.path.join(source_path, "res.json")
+    
+    # 清理旧的结果文件
+    if os.path.exists(result_file):
+        os.remove(result_file)
+    
     cmd = [
         "docker", "run", "--rm", "--name", container_name, "--ipc=host", "--network=host",
         f"--cpuset-cpus={cpuset_str}",
@@ -102,7 +108,7 @@ def run_single_benchmark(scenario, config_name, run_id, rounds, shards, cpu_limi
     cmd.append(DOCKER_IMAGE)
     cmd.extend(["python", "put_benchmark.py", "--config", config_name, "--rounds", str(rounds), "--shards", str(shards), "--output", "res.json"])
     
-    print(f"Running {branch_config['name']}...")
+    print(f"Running {branch_config['name']} - {config_name}...")
     monitor = DockerMonitor(container_name)
     try:
         p = subprocess.Popen(cmd)
@@ -110,8 +116,27 @@ def run_single_benchmark(scenario, config_name, run_id, rounds, shards, cpu_limi
         p.wait()
     finally:
         monitor.stop()
-    print(monitor.get_summary())
-    return {}
+    
+    docker_stats = monitor.get_summary()
+    print(f"  Docker Stats: {docker_stats}")
+    
+    # 读取 benchmark 结果
+    results = []
+    if os.path.exists(result_file):
+        try:
+            with open(result_file, "r") as f:
+                benchmark_results = json.load(f)
+            # 为每个结果添加 branch 信息和 docker stats
+            for r in benchmark_results:
+                r["branch"] = branch_config["name"]
+                r["docker_stats"] = docker_stats
+                results.append(r)
+        except Exception as e:
+            print(f"  Warning: Failed to read results from {result_file}: {e}")
+    else:
+        print(f"  Warning: Result file {result_file} not found")
+    
+    return results
 
 def main():
     parser = argparse.ArgumentParser()
@@ -120,13 +145,26 @@ def main():
     parser.add_argument("--rounds", type=int, default=20)
     parser.add_argument("--cpus", type=int, default=30, help="Number of CPUs to allocate for Docker container")
     parser.add_argument("--shards", type=int, default=8, help="Number of storage shards")
+    parser.add_argument("--output", type=str, default="benchmark_summary.json", help="Output summary JSON file")
     args = parser.parse_args()
     wait_until(args.start_time)
+    
+    all_results = []
     
     for branch_cfg in BRANCH_CONFIGS:
         if os.path.exists(branch_cfg["path"]):
             for config in [args.filter_config] if args.filter_config else ALL_CONFIGS:
-                run_single_benchmark(SCENARIOS[0], config, 0, args.rounds, args.shards, args.cpus, branch_cfg)
+                results = run_single_benchmark(SCENARIOS[0], config, 0, args.rounds, args.shards, args.cpus, branch_cfg)
+                all_results.extend(results)
+    
+    # 保存汇总结果
+    if all_results:
+        with open(args.output, "w") as f:
+            json.dump(all_results, f, indent=4)
+        print(f"\n💾 Summary saved to {args.output} ({len(all_results)} records)")
+    else:
+        print("\n⚠️ No results collected")
 
 if __name__ == "__main__":
     main()
+
