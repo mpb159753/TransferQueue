@@ -163,8 +163,21 @@ def run_single_benchmark_local(scenario, config_name, run_id, rounds, shards, cp
         p = subprocess.Popen(cmd)
         monitor.start()
         p.wait()
+    except KeyboardInterrupt:
+        print(f"\n[Stop] Interrupted by user. Stopping container {container_name}...")
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        raise  # Re-raise to trigger cleanup in main
+    except Exception as e:
+        print(f"Error running benchmark: {e}")
+        p.kill()
     finally:
         monitor.stop()
+        # Ensure container is stopped if it's still running (double safety)
+        subprocess.run(["docker", "stop", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     docker_stats = monitor.get_summary()
     print(f"  Docker Stats: {docker_stats}")
@@ -314,7 +327,9 @@ def main():
                     
                     if results:
                         all_results.extend(results)
-                        
+                except KeyboardInterrupt:
+                    print("\n[Main] Benchmark interrupted. Cleaning up...")
+                    break # Break inner loop, will fall through to finally
                 finally:
                     # Cleanup worker
                     if is_orchestrator:
@@ -322,6 +337,8 @@ def main():
                         # Just ssh kill python processes in deploy path?
                         subprocess.run(f"ssh -o StrictHostKeyChecking=no -i {args.ssh_key} {args.ssh_user}@{args.worker_ip} 'pkill -f run_benchmark.py'", shell=True)
                         pass
+        if args.role == "head" and is_orchestrator and not all_results:
+             break # Stop outer loop on interrupt
 
     # Save results
     if args.role in ["single", "head"] and all_results:
