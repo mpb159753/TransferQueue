@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import logging
 import os
 import socket
@@ -24,7 +25,7 @@ from uuid import uuid4
 import psutil
 import zmq
 
-from transfer_queue.utils.serial_utils import _encoder, _decoder
+from transfer_queue.utils.serial_utils import PickleContainer, _decoder, _encoder
 from transfer_queue.utils.utils import (
     ExplicitEnum,
     TransferQueueRole,
@@ -149,9 +150,25 @@ class ZMQMessage:
             "receiver_id": self.receiver_id,
             "request_id": self.request_id,
             "timestamp": self.timestamp,
-            "body": self.body,
+            "timestamp": self.timestamp,
+            "body": self._wrap_dataclasses(self.body),
         }
         return list(_encoder.encode(msg_dict))
+
+    def _wrap_dataclasses(self, obj: Any) -> Any:
+        """
+        Recursively traverse the object tree. If a dataclass instance is found,
+        wrap it in PickleContainer(obj).
+        """
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            return PickleContainer(obj)
+        elif isinstance(obj, dict):
+            return {k: self._wrap_dataclasses(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._wrap_dataclasses(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self._wrap_dataclasses(item) for item in obj)
+        return obj
 
     @classmethod
     def deserialize(cls, frames: list) -> "ZMQMessage":

@@ -21,6 +21,7 @@ import pickle
 from collections.abc import Sequence
 from types import FunctionType
 from typing import Any, Optional, TypeAlias
+from dataclasses import dataclass
 
 import cloudpickle
 import torch
@@ -34,6 +35,12 @@ CUSTOM_TYPE_TENSOR = 3  # For tensor with buffer reference
 CUSTOM_TYPE_NESTED_TENSOR = 4  # For nested tensor (strided or jagged)
 
 bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
+
+
+class PickleContainer:
+    """Wrapper to force pickling of an object (e.g. dataclasses)."""
+    def __init__(self, obj: Any):
+        self.obj = obj
 
 
 class MsgpackEncoder:
@@ -84,6 +91,9 @@ class MsgpackEncoder:
         """
         if isinstance(obj, torch.Tensor):
             return self._encode_tensor(obj)
+
+        if isinstance(obj, PickleContainer):
+            return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj.obj, protocol=pickle.HIGHEST_PROTOCOL))
         
         # Handle TensorDict explicitly for recursive zero-copy
         # Import here to avoid circular dependency and make it optional
