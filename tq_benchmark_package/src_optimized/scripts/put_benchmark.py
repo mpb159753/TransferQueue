@@ -534,9 +534,11 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        from transfer_queue.utils import serial_utils
-        print(f'[Startup Check] TQ_ZERO_COPY_SERIALIZATION = {serial_utils.TQ_ZERO_COPY_SERIALIZATION}')
-    except ImportError:
-        print('[Startup Check] Could not import serial_utils to check flag')
+    # try:
+    #     from transfer_queue.utils import serial_utils
+    #     print(f'[Startup Check] TQ_ZERO_COPY_SERIALIZATION = {serial_utils.TQ_ZERO_COPY_SERIALIZATION}')
+    # except ImportError:
+    #     print('[Startup Check] Could not import serial_utils to check flag')
+    # except AttributeError:
+    #     print('[Startup Check] TQ_ZERO_COPY_SERIALIZATION flag not found (expected in optimized version)')
     main()
