@@ -14,7 +14,7 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 from tensordict.utils import LinkedList
 
-# 添加路径以确保能引用 transfer_queue
+
 parent_dir = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(parent_dir))
 
@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # =========================================================
-# [Configuration Map] 参考 benchmark-td
+# Configuration Map
 # =========================================================
 CONFIG_MAP = {
     "debug": {
@@ -79,20 +79,21 @@ CONFIG_MAP = {
 
 
 # =========================================================
-# [Helper Functions]
+# Helper Functions
 # =========================================================
 def calculate_stats(data: list) -> dict:
+    """Calculate statistics"""
     if not data:
         return {"mean": 0.0, "max": 0.0, "min": 0.0, "p99": 0.0}
     return {
         "mean": float(np.mean(data)),
         "max": float(np.max(data)),
-        "min": float(np.min(data)),  # Added per request
+        "min": float(np.min(data)),
         "p99": float(np.percentile(data, 99))
     }
 
 
-# 不同类型的 Tensor 配置，用于测试多种数据类型的序列化性能
+# Tensor dtype configs for testing multiple data types
 DTYPE_CONFIGS = [
     {"dtype": torch.float32, "bytes_per_elem": 4},
     {"dtype": torch.int64, "bytes_per_elem": 8},
@@ -103,7 +104,7 @@ DTYPE_CONFIGS = [
 
 
 def _generate_regular_tensor(batch_size, seq_length, dtype):
-    """生成普通 Tensor"""
+    """Generate regular Tensor"""
     if dtype in (torch.int32, torch.int64):
         return torch.randint(0, 10000, (batch_size, seq_length), dtype=dtype)
     else:
@@ -112,25 +113,25 @@ def _generate_regular_tensor(batch_size, seq_length, dtype):
 
 def _generate_nested_tensor(batch_size, total_elements, dtype):
     """
-    生成 NestedTensor，每个样本的长度随机，但总元素数保持一致。
-    使用 Dirichlet 分布确保随机分配且总和固定。
+    Generate NestedTensor with random lengths per sample, but consistent total elements.
+    Uses Dirichlet distribution to ensure random allocation with fixed sum.
     """
-    # 使用 Dirichlet 分布生成随机比例，确保总和为 1
+    # Use Dirichlet distribution to generate random proportions summing to 1
     proportions = np.random.dirichlet(np.ones(batch_size))
     lengths = (proportions * total_elements).astype(int)
     
-    # 修正舍入误差，确保总元素数精确
+    # Fix rounding errors to ensure exact total element count
     diff = total_elements - lengths.sum()
     if diff != 0:
-        # 将差值分配给最大的几个元素
+        # Distribute difference to largest elements
         indices = np.argsort(lengths)[::-1]
         for i in range(abs(diff)):
             lengths[indices[i % batch_size]] += 1 if diff > 0 else -1
     
-    # 确保每个长度至少为 1
+    # Ensure each length is at least 1
     lengths = np.maximum(lengths, 1)
     
-    # 生成不同长度的 tensor 列表
+    # Generate tensors with different lengths
     tensors = []
     for length in lengths:
         if dtype in (torch.int32, torch.int64):
@@ -143,9 +144,9 @@ def _generate_nested_tensor(batch_size, total_elements, dtype):
 
 def create_complex_test_case(batch_size, seq_length, field_num):
     """
-    构造测试数据，使用不同类型的 Tensor 来测试序列化性能。
-    - 偶数字段: 普通 Tensor (float32, int64, float64, int32, float16 轮流)
-    - 奇数字段: NestedTensor (随机长度，但总数据量与普通 Tensor 相同)
+    Create test data using different Tensor types for serialization performance testing.
+    - Even-indexed fields: Regular Tensor (float32, int64, float64, int32, float16 rotating)
+    - Odd-indexed fields: NestedTensor (random lengths, same total data volume)
     """
     total_size_bytes = 0
     fields = {}
@@ -158,10 +159,10 @@ def create_complex_test_case(batch_size, seq_length, field_num):
         bytes_per_elem = dtype_config["bytes_per_elem"]
 
         if i % 2 == 0:
-            # 偶数字段: 普通 Tensor
+            # Even-indexed fields: Regular Tensor
             tensor_data = _generate_regular_tensor(batch_size, seq_length, dtype)
         else:
-            # 奇数字段: NestedTensor (随机长度，总元素数相同)
+            # Odd-indexed fields: NestedTensor (random lengths, same total elements)
             tensor_data = _generate_nested_tensor(batch_size, total_elements_per_field, dtype)
 
         fields[field_name] = tensor_data
@@ -185,8 +186,8 @@ def remove_placement_group(placement_group):
 
 
 def _compare_nested_tensors(original, retrieved, path):
-    """比较两个 NestedTensor 的一致性"""
-    # 解包为列表进行逐个比较
+    """Compare two NestedTensors for consistency"""
+    # Unbind to list for element-wise comparison
     orig_tensors = original.unbind()
     retr_tensors = retrieved.unbind()
     
@@ -206,13 +207,13 @@ def _compare_nested_tensors(original, retrieved, path):
 
 def check_data_consistency(original, retrieved, path="root"):
     """
-    数据一致性校验 (支持 TensorDict、Tensor 及 NestedTensor)
+    Data consistency verification (supports TensorDict, Tensor, and NestedTensor)
     """
     try:
         if isinstance(original, list) and isinstance(retrieved, LinkedList):
             retrieved = list(retrieved)
 
-        # NestedTensor 检查 (必须在普通 Tensor 之前，因为 NestedTensor 也是 Tensor)
+        # NestedTensor check (must be before regular Tensor since NestedTensor is also a Tensor)
         if original.is_nested if hasattr(original, 'is_nested') else False:
             if not (retrieved.is_nested if hasattr(retrieved, 'is_nested') else False):
                 return False, f"[{path}] Type mismatch: NestedTensor vs non-NestedTensor"
@@ -251,25 +252,31 @@ def check_data_consistency(original, retrieved, path="root"):
 
 
 # =========================================================
-# [Core Tester Class]
+# Core Tester Class
 # =========================================================
 
-# --- Profiling Hook Helper ---
-import os
-import time
 def sync_stage(flag_to_create, flag_to_wait):
-    with open(flag_to_create, 'w') as f: f.write('1')
-    while not os.path.exists(flag_to_wait): time.sleep(0.05)
-    try: os.remove(flag_to_wait)
-    except: pass
-# -----------------------------
+    """Profile sync helper function for synchronizing with external profiler process"""
+    with open(flag_to_create, 'w') as f:
+        f.write('1')
+    while not os.path.exists(flag_to_wait):
+        time.sleep(0.05)
+    try:
+        os.remove(flag_to_wait)
+    except:
+        pass
+
 
 class TQBandwidthTester:
-    def __init__(self, target_ip=None, storage_units=8, enable_profile=False):
+    def __init__(self, target_ip=None, storage_units=8, enable_profile=False, role="single", head_ip=None, worker_ip=None):
         self.target_ip = target_ip
         self.num_storage_units = storage_units
         self.remote_mode = target_ip is not None
         self.enable_profile = enable_profile
+        self.role = role
+        self.head_ip = head_ip
+        self.worker_ip = worker_ip
+        
         self.data_system_client = None
         self.tq_config = None
         self.data_system_controller = None
@@ -277,10 +284,8 @@ class TQBandwidthTester:
         self.storage_placement_group = None
 
     def initialize_system(self, config_dict):
-        """
-        根据当前配置初始化 TransferQueue 系统
-        """
-        # 基础配置转换
+        """Initialize TransferQueue system based on current configuration"""
+        # Basic config conversion
         self.tq_config = OmegaConf.create({
             "global_batch_size": config_dict["global_batch_size"],
             "num_global_batch": 1,
@@ -290,10 +295,22 @@ class TQBandwidthTester:
 
         total_storage_size = self.tq_config.global_batch_size * 2
 
-        logger.info(f"Initializing Storage Units (Remote={self.remote_mode}, Target={self.target_ip})...")
+        logger.info(f"Initializing Storage Units (Role={self.role}, WorkerIP={self.worker_ip})...")
 
-        if self.remote_mode:
-            # Remote Mode: Force placement on specific worker IP
+        if self.worker_ip:
+            # Dual-node mode: Force placement on specific worker IP
+            logger.info(f"Placing storage units on worker node: {self.worker_ip}")
+            for rank in range(self.num_storage_units):
+                self.data_system_storage_units[rank] = SimpleStorageUnit.options(
+                    num_cpus=1,
+                    resources={f"node:{self.worker_ip}": 0.001},
+                    runtime_env={"env_vars": {"OMP_NUM_THREADS": "2"}},
+                ).remote(
+                    storage_unit_size=math.ceil(total_storage_size / self.num_storage_units)
+                )
+
+        elif self.remote_mode:
+            # Legacy Remote Mode (single cluster, force placement on node IP if provided in target_ip)
             for rank in range(self.num_storage_units):
                 self.data_system_storage_units[rank] = SimpleStorageUnit.options(
                     num_cpus=1,
@@ -338,35 +355,35 @@ class TQBandwidthTester:
         return self.data_system_client
 
     def cleanup(self):
-        """显式清理 Ray 资源"""
+        """Explicitly cleanup Ray resources"""
         logger.info("Cleaning up previous Ray resources...")
 
-        # 1. 销毁 Controller Actor
+        # 1. Kill Controller Actor
         if self.data_system_controller:
             ray.kill(self.data_system_controller)
             self.data_system_controller = None
 
-        # 2. 销毁 Storage Unit Actors
+        # 2. Kill Storage Unit Actors
         if self.data_system_storage_units:
             for unit in self.data_system_storage_units.values():
                 ray.kill(unit)
             self.data_system_storage_units = {}
 
-        # 3. 销毁 Placement Group (释放预留的 CPU/资源束)
+        # 3. Remove Placement Group (release reserved CPU/resource bundles)
         if self.storage_placement_group:
             remove_placement_group(self.storage_placement_group)
             self.storage_placement_group = None
 
-        # 4. 强制垃圾回收
+        # 4. Force garbage collection
         import gc
         gc.collect()
 
-        # 5. 等待 Ray 调度器更新状态 (防止 Race Condition)
+        # 5. Wait for Ray scheduler to update state (prevent race condition)
         time.sleep(2)
 
     def run_benchmark_rounds(self, config_name, config, rounds):
-        # 1. Generate Data
-        logger.info(f"Generating data for [{config_name}]...")
+        """Run multiple rounds of PUT/GET bandwidth tests"""
+        logger.info(f"Generating test data [{config_name}]...")
         big_input_ids, total_gb = create_complex_test_case(
             batch_size=config["global_batch_size"],
             seq_length=config["seq_length"],
@@ -382,7 +399,7 @@ class TQBandwidthTester:
         for i in range(rounds):
             partition_key = f"bench_{config_name}_{i}"
 
-            # --- PUT ---
+            # PUT operation
             start_put = time.time()
             if i == 0 and self.enable_profile:
                 sync_stage('init_ready.flag', 'put_start.flag')
@@ -394,8 +411,7 @@ class TQBandwidthTester:
             put_gbps = (total_gb * 8) / put_time
             put_speeds.append(put_gbps)
             time.sleep(2)
-            # --- GET META (Necessary for TQ flow but not counted in pure bandwidth usually, but we log time) ---
-            # To simulate real flow, we must get meta first
+            # Get metadata (required step for TQ flow)
             prompt_meta = asyncio.run(self.data_system_client.async_get_meta(
                 data_fields=list(big_input_ids.keys()),
                 batch_size=big_input_ids.size(0),
@@ -403,7 +419,7 @@ class TQBandwidthTester:
                 task_name='generate_sequences',
             ))
 
-            # --- GET DATA ---
+            # GET operation
             start_get = time.time()
             if i == 0 and self.enable_profile:
                 sync_stage('get_ready.flag', 'get_start.flag')
@@ -415,7 +431,7 @@ class TQBandwidthTester:
 
             print(f"\r  Round {i + 1}/{rounds}: PUT {put_gbps:.2f} Gbps | GET {get_gbps:.2f} Gbps", end="")
 
-            # --- Verification (First and Last Round only) ---
+            # Data consistency verification (first and last round only)
             if i == 0 or i == rounds - 1:
                 is_consistent, msg = check_data_consistency(big_input_ids, retrieved_data)
                 if not is_consistent:
@@ -425,8 +441,8 @@ class TQBandwidthTester:
             asyncio.run(self.data_system_client.async_clear_partition(partition_id=partition_key))
         print("\n")
 
-        # Result construction
         def make_result(op, speeds):
+            """Construct result dictionary"""
             return {
                 "scenario": "TransferQueue",
                 "setting": f"{config_name} (Remote)" if self.remote_mode else f"{config_name} (Local)",
@@ -440,62 +456,78 @@ class TQBandwidthTester:
 
 
 # =========================================================
-# [Main]
+# Main Function
 # =========================================================
 def main():
     parser = argparse.ArgumentParser(description="TransferQueue Bandwidth Benchmark")
-    parser.add_argument("--ip", type=str, default=None, help="Worker Node IP. Local test if not set.")
+    parser.add_argument("--ip", type=str, default=None, help="Worker node IP, local test if not set")
     parser.add_argument("--config", type=str, default=None, choices=list(CONFIG_MAP.keys()),
-                        help="Specific config to run.")
-    parser.add_argument("--output", type=str, default="tq_benchmark_result.json", help="Output JSON file.")
+                        help="Specific config to run")
+    parser.add_argument("--output", type=str, default="tq_benchmark_result.json", help="Output JSON file")
     parser.add_argument("--rounds", type=int, default=20, help="Test rounds per config (default: 20)")
     parser.add_argument("--shards", type=int, default=8, help="Number of storage units (default: 8)")
     parser.add_argument("--profile", action="store_true", help="Enable profile sync (requires external profiler)")
+    
+    # Dual-node args
+    parser.add_argument("--role", type=str, default="single", choices=["single", "head", "worker"], help="Node role")
+    parser.add_argument("--head-ip", type=str, help="Head node IP")
+    parser.add_argument("--worker-ip", type=str, help="Worker node IP")
 
     args = parser.parse_args()
 
-    # 1. Ray Init
+    # Initialize Ray
     current_working_dir = os.getcwd()
     if not ray.is_initialized():
-        ray.init(
-            address="auto" if args.ip else None,
-            runtime_env={"working_dir": current_working_dir}
-        )
+        if args.role == "worker":
+            if not args.head_ip:
+                raise ValueError("Worker role requires --head-ip")
+            ray.init(address=f"ray://{args.head_ip}:10001", runtime_env={"working_dir": current_working_dir})
+        elif args.role == "head":
+            ray.init(address="auto", runtime_env={"working_dir": current_working_dir})
+        else:
+            # Single mode
+            ray.init(
+                address="auto" if args.ip else None,
+                runtime_env={"working_dir": current_working_dir}
+            )
 
-    logger.info(f"Ray Initialized. Remote Target: {args.ip if args.ip else 'Local'}")
+    logger.info(f"Ray initialized. Role: {args.role}")
 
-    # 2. Setup Tester
-    tester = TQBandwidthTester(target_ip=args.ip, storage_units=args.shards, enable_profile=args.profile)
+    # Create tester
+    tester = TQBandwidthTester(target_ip=args.ip, storage_units=args.shards, enable_profile=args.profile, 
+                               role=args.role, head_ip=args.head_ip, worker_ip=args.worker_ip)
 
-    # 3. Execution Loop
+    # Run tests
     run_list = [args.config] if args.config else list(CONFIG_MAP.keys())
     final_results = []
 
     try:
+        # If worker, we just wait (keep alive)
+        if args.role == "worker":
+            # Just keep the process alive so that Ray node stays up and we can schedule tasks on it via head
+            # But wait, run_benchmark.py keeps docker alive via this script?
+            # Yes, run_single_benchmark_local calls this script.
+            # So this script must not exit.
+            logger.info(f"Worker node started. Connected to Head {args.head_ip}. Waiting for tasks...")
+            while True:
+                time.sleep(10)
+        
+        # Head or Single
         for cfg_name in run_list:
             cfg = CONFIG_MAP[cfg_name]
-
-            # Re-initialize system per config to match batch sizes (optional, but safer for memory alloc)
-            # Or we can init once if we want to reuse actors.
-            # Here we follow TQ pattern: usually TQ is long-lived, but config changes might require reset.
-            # To be safe and isolating tests, we re-init client logic, but Actors are persistent if we don't kill them.
-            # For this script, let's keep actors alive but re-configure client if needed.
-            # Simplified: Call initialize_system each time for cleanliness or do it once if config compatible.
-            # Given TQ structure, let's init once per config loop to ensure correct 'storage_unit_size' calculation based on config.
-
+            # Re-initialize system for each config to ensure correct storage_unit_size calculation
             tester.cleanup()
-
             tester.initialize_system(cfg)
             res = tester.run_benchmark_rounds(cfg_name, cfg, args.rounds)
             final_results.extend(res)
 
-        # 4. Save Results
+        # Save results
         with open(args.output, "w") as f:
             json.dump(final_results, f, indent=4)
         logger.info(f"💾 Results saved to {args.output}")
 
     except Exception as e:
-        logger.error(f"❌ Critical Error: {e}", exc_info=True)
+        logger.error(f"❌ Critical error: {e}", exc_info=True)
     finally:
         if ray.is_initialized():
             ray.shutdown()
@@ -504,7 +536,7 @@ def main():
 if __name__ == "__main__":
     try:
         from transfer_queue.utils import serial_utils
-        print(f'[Benchmark Startup Check] TQ_ZERO_COPY_SERIALIZATION = {serial_utils.TQ_ZERO_COPY_SERIALIZATION}')
+        print(f'[Startup Check] TQ_ZERO_COPY_SERIALIZATION = {serial_utils.TQ_ZERO_COPY_SERIALIZATION}')
     except ImportError:
-        print('[Benchmark Startup Check] Could not import serial_utils to check flag.')
+        print('[Startup Check] Could not import serial_utils to check flag')
     main()

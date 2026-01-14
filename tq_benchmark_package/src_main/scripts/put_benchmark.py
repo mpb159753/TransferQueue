@@ -268,11 +268,15 @@ def sync_stage(flag_to_create, flag_to_wait):
 
 
 class TQBandwidthTester:
-    def __init__(self, target_ip=None, storage_units=8, enable_profile=False):
+    def __init__(self, target_ip=None, storage_units=8, enable_profile=False, role="single", head_ip=None, worker_ip=None):
         self.target_ip = target_ip
         self.num_storage_units = storage_units
         self.remote_mode = target_ip is not None
         self.enable_profile = enable_profile
+        self.role = role
+        self.head_ip = head_ip
+        self.worker_ip = worker_ip
+        
         self.data_system_client = None
         self.tq_config = None
         self.data_system_controller = None
@@ -291,10 +295,22 @@ class TQBandwidthTester:
 
         total_storage_size = self.tq_config.global_batch_size * 2
 
-        logger.info(f"Initializing Storage Units (Remote={self.remote_mode}, Target={self.target_ip})...")
+        logger.info(f"Initializing Storage Units (Role={self.role}, WorkerIP={self.worker_ip})...")
 
-        if self.remote_mode:
-            # Remote Mode: Force placement on specific worker IP
+        if self.worker_ip:
+            # Dual-node mode: Force placement on specific worker IP
+            logger.info(f"Placing storage units on worker node: {self.worker_ip}")
+            for rank in range(self.num_storage_units):
+                self.data_system_storage_units[rank] = SimpleStorageUnit.options(
+                    num_cpus=1,
+                    resources={f"node:{self.worker_ip}": 0.001},
+                    runtime_env={"env_vars": {"OMP_NUM_THREADS": "2"}},
+                ).remote(
+                    storage_unit_size=math.ceil(total_storage_size / self.num_storage_units)
+                )
+
+        elif self.remote_mode:
+            # Legacy Remote Mode (single cluster, force placement on node IP if provided in target_ip)
             for rank in range(self.num_storage_units):
                 self.data_system_storage_units[rank] = SimpleStorageUnit.options(
                     num_cpus=1,
@@ -452,26 +468,47 @@ def main():
     parser.add_argument("--shards", type=int, default=8, help="Number of storage units (default: 8)")
     parser.add_argument("--profile", action="store_true", help="Enable profile sync (requires external profiler)")
 
+    # Dual-node args
+    parser.add_argument("--role", type=str, default="single", choices=["single", "head", "worker"], help="Node role")
+    parser.add_argument("--head-ip", type=str, help="Head node IP")
+    parser.add_argument("--worker-ip", type=str, help="Worker node IP")
+
     args = parser.parse_args()
 
     # Initialize Ray
     current_working_dir = os.getcwd()
     if not ray.is_initialized():
-        ray.init(
-            address="auto" if args.ip else None,
-            runtime_env={"working_dir": current_working_dir}
-        )
+        if args.role == "worker":
+            if not args.head_ip:
+                raise ValueError("Worker role requires --head-ip")
+            ray.init(address=f"ray://{args.head_ip}:10001", runtime_env={"working_dir": current_working_dir})
+        elif args.role == "head":
+            ray.init(address="auto", runtime_env={"working_dir": current_working_dir})
+        else:
+            # Single mode
+            ray.init(
+                address="auto" if args.ip else None,
+                runtime_env={"working_dir": current_working_dir}
+            )
 
-    logger.info(f"Ray initialized. Target: {args.ip if args.ip else 'Local'}")
+    logger.info(f"Ray initialized. Role: {args.role}")
 
     # Create tester
-    tester = TQBandwidthTester(target_ip=args.ip, storage_units=args.shards, enable_profile=args.profile)
+    tester = TQBandwidthTester(target_ip=args.ip, storage_units=args.shards, enable_profile=args.profile, 
+                               role=args.role, head_ip=args.head_ip, worker_ip=args.worker_ip)
 
     # Run tests
     run_list = [args.config] if args.config else list(CONFIG_MAP.keys())
     final_results = []
 
     try:
+        # If worker, we just wait (keep alive)
+        if args.role == "worker":
+            logger.info(f"Worker node started. Connected to Head {args.head_ip}. Waiting for tasks...")
+            while True:
+                time.sleep(10)
+        
+        # Head or Single
         for cfg_name in run_list:
             cfg = CONFIG_MAP[cfg_name]
             # Re-initialize system for each config to ensure correct storage_unit_size calculation

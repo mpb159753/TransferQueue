@@ -22,7 +22,7 @@ def run_profiling(config_name, round_count, branch_cfg, shards=8, cpu_limit=8):
     # We must start 'container_profiler.py' inside via docker
     # Benchmark cmd: python put_benchmark.py ...
     bench_cmd = [
-        "python", "put_benchmark.py", 
+        "python", "scripts/put_benchmark.py", 
         "--config", config_name, 
         "--rounds", str(round_count), 
         "--shards", str(shards),

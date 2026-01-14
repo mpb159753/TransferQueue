@@ -7,6 +7,9 @@ import subprocess
 import threading
 import datetime
 import re
+import socket
+
+# from transfer_queue.utils import zmq_utils # Needed for get_ip_address if available, or use socket
 
 DOCKER_IMAGE = "run_test"
 ALL_CONFIGS = ["debug", "tiny", "small", "medium", "large", "xlarge", "huge"]
@@ -18,6 +21,17 @@ BRANCH_CONFIGS = [
     {"name": "main-zerocopy", "path": "src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "true"}, "description": "ZeroCopy"},
 ]
 SCENARIOS = [{"name": "TransferQueue", "cmd_args": [], "env_vars": {"PYTHONPATH": "."}, "workdir": "."}]
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # doesn't even have to be reachable
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+        s.close()
+    except Exception:
+        IP = '127.0.0.1'
+    return IP
 
 class DockerMonitor:
     def __init__(self, container_name, interval=0.5):
@@ -87,14 +101,14 @@ def get_cpuset_range(count, offset=2):
     if end >= total_cpus: start = 0; end = count - 1
     return f"{start}-{end}"
 
-def run_single_benchmark(scenario, config_name, run_id, rounds, shards, cpu_limit, branch_config):
+def run_single_benchmark_local(scenario, config_name, run_id, rounds, shards, cpu_limit, branch_config, role="single", head_ip=None, worker_ip=None):
     container_name = f"bench_{run_id}_{int(time.time())}"
     source_path = os.path.abspath(branch_config["path"])
     cpuset_str = get_cpuset_range(cpu_limit)
     result_file = os.path.join(source_path, "res.json")
     
-    # 清理旧的结果文件
-    if os.path.exists(result_file):
+    # Clean up old result file only if we are head or single
+    if role in ["single", "head"] and os.path.exists(result_file):
         os.remove(result_file)
     
     cmd = [
@@ -106,9 +120,22 @@ def run_single_benchmark(scenario, config_name, run_id, rounds, shards, cpu_limi
     ]
     for k, v in branch_config.get("env_vars", {}).items(): cmd.extend(["-e", f"{k}={v}"])
     cmd.append(DOCKER_IMAGE)
-    cmd.extend(["python", "put_benchmark.py", "--config", config_name, "--rounds", str(rounds), "--shards", str(shards), "--output", "res.json"])
     
-    print(f"Running {branch_config['name']} - {config_name}...")
+    # Construct python command
+    py_cmd = ["python", "scripts/put_benchmark.py", "--config", config_name, "--rounds", str(rounds), "--shards", str(shards)]
+    if role in ["single", "head"]:
+        py_cmd.extend(["--output", "res.json"])
+    
+    # Add network/role args
+    py_cmd.extend(["--role", role])
+    if head_ip:
+        py_cmd.extend(["--head-ip", head_ip])
+    if worker_ip:
+        py_cmd.extend(["--worker-ip", worker_ip])
+
+    cmd.extend(py_cmd)
+    
+    print(f"Running {branch_config['name']} - {config_name} [Role: {role}]...")
     monitor = DockerMonitor(container_name)
     try:
         p = subprocess.Popen(cmd)
@@ -120,23 +147,67 @@ def run_single_benchmark(scenario, config_name, run_id, rounds, shards, cpu_limi
     docker_stats = monitor.get_summary()
     print(f"  Docker Stats: {docker_stats}")
     
-    # 读取 benchmark 结果
+    # Only read results if we are head or single
     results = []
-    if os.path.exists(result_file):
-        try:
-            with open(result_file, "r") as f:
-                benchmark_results = json.load(f)
-            # 为每个结果添加 branch 信息和 docker stats
-            for r in benchmark_results:
-                r["branch"] = branch_config["name"]
-                r["docker_stats"] = docker_stats
-                results.append(r)
-        except Exception as e:
-            print(f"  Warning: Failed to read results from {result_file}: {e}")
-    else:
-        print(f"  Warning: Result file {result_file} not found")
+    if role in ["single", "head"]:
+        if os.path.exists(result_file):
+            try:
+                with open(result_file, "r") as f:
+                    benchmark_results = json.load(f)
+                for r in benchmark_results:
+                    r["branch"] = branch_config["name"]
+                    r["docker_stats"] = docker_stats
+                    results.append(r)
+            except Exception as e:
+                print(f"  Warning: Failed to read results from {result_file}: {e}")
+        else:
+            print(f"  Warning: Result file {result_file} not found")
     
     return results
+
+def deploy_and_run_worker(worker_ip, ssh_user, ssh_key, deploy_path, branch_config, config_name, rounds, shards, docker_cpu, head_ip):
+    print(f"\n[Deploy] Syncing code to {worker_ip}...")
+    
+    ssh_opts = f"-o StrictHostKeyChecking=no -i {ssh_key}"
+    
+    # 1. Create directory
+    subprocess.run(f"ssh {ssh_opts} {ssh_user}@{worker_ip} 'mkdir -p {deploy_path}'", shell=True, check=True)
+    
+    # 2. Rsync current package
+    # exclude results and __pycache__
+    rsync_cmd = f"rsync -avz -e 'ssh {ssh_opts}' --exclude '*.json' --exclude '__pycache__' ./ {ssh_user}@{worker_ip}:{deploy_path}/"
+    subprocess.run(rsync_cmd, shell=True, check=True)
+    
+    # 3. Run worker command in background
+    print(f"[Worker] Starting worker on {worker_ip}...")
+    
+    # We need to construct the same command but for worker role settings
+    # This involves running run_benchmark.py itself on the remote node with specific flags
+    # But to simplify, we can directly invoke the docker command or re-invoke this script.
+    # Re-invoking this script is cleaner as it manages docker args.
+    
+    remote_cmd = (
+        f"cd {deploy_path} && "
+        f"python3 run_benchmark.py "
+        f"--role worker "
+        f"--head-ip {head_ip} "
+        f"--worker-ip {worker_ip} "
+        f"--config {config_name} " # Just to pick the right params, though worker ignores benchmarking logic
+        f"--rounds {rounds} "
+        f"--shards {shards} "
+        f"--cpus {docker_cpu} "
+        f"--filter_branch {branch_config['name']}" # Only run specific branch logic
+    )
+    
+    # Run in background via nohup, we don't wait for it here
+    final_ssh_cmd = f"ssh {ssh_opts} {ssh_user}@{worker_ip} '{remote_cmd}'"
+    print(f"CMD: {final_ssh_cmd}")
+    
+    # We use Popen to run it without waiting, effectively creating a parallel process
+    # But for a worker, we generally want it to stay up until we kill it or it finishes?
+    # Actually, if we run it via SSH and want to kill it later, we track it.
+    # For now, let's just Popen and keep the handle.
+    return subprocess.Popen(final_ssh_cmd, shell=True)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -146,23 +217,86 @@ def main():
     parser.add_argument("--cpus", type=int, default=30, help="Number of CPUs to allocate for Docker container")
     parser.add_argument("--shards", type=int, default=8, help="Number of storage shards")
     parser.add_argument("--output", type=str, default="benchmark_summary.json", help="Output summary JSON file")
+    
+    # Dual-node args
+    parser.add_argument("--role", type=str, default="single", choices=["single", "head", "worker"], help="Node role")
+    parser.add_argument("--head-ip", type=str, help="Head node IP (required for worker)")
+    parser.add_argument("--worker-ip", type=str, help="Worker node IP (for deployment or identification)")
+    parser.add_argument("--ssh-user", type=str, default=os.getlogin(), help="SSH user for remote deployment")
+    parser.add_argument("--ssh-key", type=str, default=os.path.expanduser("~/.ssh/id_rsa"), help="SSH key path")
+    parser.add_argument("--deploy-path", type=str, default="~/tq_benchmark_package", help="Remote deployment path")
+    parser.add_argument("--filter_branch", type=str, help="Filter specific branch config to run (internal use)")
+
     args = parser.parse_args()
     wait_until(args.start_time)
     
+    # If we are in 'single' mode but have a worker_ip, we become the 'head' orchestrator
+    is_orchestrator = args.role == "single" and args.worker_ip is not None
+    
+    if is_orchestrator:
+        print("[Mode] Dual-node Orchestrator (Auto-Deploy)")
+        my_ip = get_local_ip()
+        print(f"Local IP (Head): {my_ip}")
+        print(f"Remote IP (Worker): {args.worker_ip}")
+        
+        args.head_ip = my_ip
+        args.role = "head" # We will run as head locally
+    
     all_results = []
     
-    for branch_cfg in BRANCH_CONFIGS:
+    # Filter branches if requested (e.g. by remote worker invocation)
+    target_branches = BRANCH_CONFIGS
+    if args.filter_branch:
+        target_branches = [b for b in BRANCH_CONFIGS if b["name"] == args.filter_branch]
+    
+    for branch_cfg in target_branches:
         if os.path.exists(branch_cfg["path"]):
             for config in [args.filter_config] if args.filter_config else ALL_CONFIGS:
-                results = run_single_benchmark(SCENARIOS[0], config, 0, args.rounds, args.shards, args.cpus, branch_cfg)
-                all_results.extend(results)
-    
-    # 保存汇总结果
-    if all_results:
+                
+                # If orchestrator, deploy and start worker first
+                worker_proc = None
+                if is_orchestrator:
+                    print("-" * 50)
+                    print(f"Preparing Dual-Node Test for {branch_cfg['name']} - {config}")
+                    worker_proc = deploy_and_run_worker(
+                        args.worker_ip, args.ssh_user, args.ssh_key, args.deploy_path,
+                        branch_cfg, config, args.rounds, args.shards, args.cpus, args.head_ip
+                    )
+                    # Give worker some time to start up Docker and Ray
+                    print("Waiting 10s for worker to initialize...")
+                    time.sleep(10)
+                
+                try:
+                    # Run local logic (Single, Head, or Worker)
+                    # Note: If we are 'worker', this runs the container which connects to head.
+                    # If we are 'head', this runs container, waits/connects, runs bench.
+                    results = run_single_benchmark_local(
+                        SCENARIOS[0], config, 0, args.rounds, args.shards, args.cpus, 
+                        branch_cfg, role=args.role, head_ip=args.head_ip, worker_ip=args.worker_ip
+                    )
+                    
+                    if results:
+                        all_results.extend(results)
+                        
+                finally:
+                    # Cleanup worker if we started it
+                    if worker_proc:
+                        print("Stopping remote worker...")
+                        # Ideally we should send a signal or kill the remote docker
+                        # Basic kill of ssh process
+                        worker_proc.terminate()
+                        # Better: kill remote docker? We rely on --rm in docker run.
+                        # But --rm only works if process exits.
+                        # For now, rely on SIGTERM traversing ssh? Likely need manual cleanup or timeout.
+                        # In production test, maybe implement a cleaner shutdown.
+                        pass
+
+    # Save results if we are head/single
+    if args.role in ["single", "head"] and all_results:
         with open(args.output, "w") as f:
             json.dump(all_results, f, indent=4)
         print(f"\n💾 Summary saved to {args.output} ({len(all_results)} records)")
-    else:
+    elif args.role in ["single", "head"]:
         print("\n⚠️ No results collected")
 
 if __name__ == "__main__":
