@@ -15,7 +15,7 @@ from tensordict import TensorDict
 from tensordict.utils import LinkedList
 
 
-parent_dir = Path(__file__).resolve().parent.parent.parent
+parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
 
 from transfer_queue import (
