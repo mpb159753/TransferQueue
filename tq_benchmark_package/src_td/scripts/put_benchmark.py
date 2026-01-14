@@ -294,10 +294,17 @@ def main():
 
     args = parser.parse_args()
 
-    # 1. Init Ray (use auto because Ray is started by run_benchmark.py inside Docker)
+    # 1. Init Ray
+    # - For standalone local testing: init without address
+    # - For Docker/dual-node: use address="auto" (Ray cluster started externally)
     current_working_dir = os.getcwd()
     if not ray.is_initialized():
-        ray.init(address="auto", runtime_env={"working_dir": current_working_dir})
+        if args.role == "single" and not args.ip and not args.worker_ip:
+            # Standalone local mode - start a new local Ray cluster
+            ray.init(runtime_env={"working_dir": current_working_dir})
+        else:
+            # Docker or dual-node mode - connect to existing Ray cluster
+            ray.init(address="auto", runtime_env={"working_dir": current_working_dir})
 
     logger.info(f"Ray initialized. Role: {args.role}")
 
