@@ -128,13 +128,13 @@ def run_single_benchmark_local(scenario, config_name, run_id, rounds, shards, cp
     cmd.append(DOCKER_IMAGE)
     
     # Construct command to start Ray inside container
-    # Note: We do NOT use ray stop as requested, to avoid affecting other processes.
+    # Explicitly bind to specific IP to avoid wrong interface binding in multi-NIC env
     ray_start_cmd = ""
     if role == "head":
-        ray_start_cmd = f"ray start --head --port={head_port} --num-cpus={int(cpu_limit)} --include-dashboard=false --disable-usage-stats --block & sleep 5 && "
+        ray_start_cmd = f"ray start --head --node-ip-address={head_ip} --port={head_port} --num-cpus={int(cpu_limit)} --include-dashboard=false --disable-usage-stats --block & sleep 5 && "
     elif role == "worker":
         # Worker connects to Head
-        ray_start_cmd = f"ray start --address={head_ip}:{head_port} --num-cpus={int(cpu_limit)} --disable-usage-stats --block & sleep 5 && "
+        ray_start_cmd = f"ray start --address={head_ip}:{head_port} --node-ip-address={worker_ip} --num-cpus={int(cpu_limit)} --disable-usage-stats --block & sleep 5 && "
     elif role == "single":
         # Single mode: start head locally
         ray_start_cmd = f"ray start --head --port={head_port or 6379} --num-cpus={int(cpu_limit)} --include-dashboard=false --disable-usage-stats --block & sleep 5 && "
@@ -252,7 +252,8 @@ def main():
          # Generate a random port for head
         head_port = get_free_port()
         print(f"[Mode] Dual-node Orchestrator (Auto-Deploy). Selected Head Port: {head_port}")
-        my_ip = get_local_ip()
+        # Detect correct local IP that can reach the worker
+        my_ip = get_local_ip(target=args.worker_ip)
         print(f"Local IP (Head): {my_ip}")
         print(f"Remote IP (Worker): {args.worker_ip}")
         
