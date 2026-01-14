@@ -232,7 +232,7 @@ def main():
     
     # Dual-node args
     parser.add_argument("--role", type=str, default="single", choices=["single", "head", "worker"], help="Node role")
-    parser.add_argument("--head-ip", type=str, help="Head node IP (required for worker)")
+    parser.add_argument("--head-ip", type=str, default="192.168.100.1", help="Head node IP (required for worker)")
     parser.add_argument("--head-port", type=int, help="Head node Port (for worker)")
     parser.add_argument("--worker-ip", type=str, help="Worker node IP (for deployment or identification)")
     parser.add_argument("--ssh-user", type=str, default="root", help="SSH user for remote deployment")
@@ -252,8 +252,8 @@ def main():
          # Generate a random port for head
         head_port = get_free_port()
         print(f"[Mode] Dual-node Orchestrator (Auto-Deploy). Selected Head Port: {head_port}")
-        # Detect correct local IP that can reach the worker
-        my_ip = get_local_ip(target=args.worker_ip)
+        # Hardcode Head IP as 192.168.100.1 per user request (simplification)
+        my_ip = "192.168.100.1"
         print(f"Local IP (Head): {my_ip}")
         print(f"Remote IP (Worker): {args.worker_ip}")
         
