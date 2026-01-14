@@ -473,25 +473,24 @@ def main():
     parser.add_argument("--head-ip", type=str, help="Head node IP")
     parser.add_argument("--worker-ip", type=str, help="Worker node IP")
 
+    parser.add_argument("--wait-nodes", type=int, default=0, help="Wait for N nodes to be available before starting")
+
     args = parser.parse_args()
 
     # Initialize Ray
     current_working_dir = os.getcwd()
     if not ray.is_initialized():
-        if args.role == "worker":
-            if not args.head_ip:
-                raise ValueError("Worker role requires --head-ip")
-            ray.init(address=f"ray://{args.head_ip}:10001", runtime_env={"working_dir": current_working_dir})
-        elif args.role == "head":
-            ray.init(address="auto", runtime_env={"working_dir": current_working_dir})
-        else:
-            # Single mode
-            ray.init(
-                address="auto" if args.ip else None,
-                runtime_env={"working_dir": current_working_dir}
-            )
+        # Always use auto because Ray is started by the wrapper script (run_benchmark.py) inside Docker
+        ray.init(address="auto", runtime_env={"working_dir": current_working_dir})
 
     logger.info(f"Ray initialized. Role: {args.role}")
+    
+    if args.wait_nodes > 0:
+        logger.info(f"Waiting for {args.wait_nodes} nodes...")
+        while len(ray.nodes()) < args.wait_nodes:
+            logger.info(f"Current nodes: {len(ray.nodes())}/{args.wait_nodes}")
+            time.sleep(2)
+        logger.info("All nodes are ready!")
 
     # Create tester
     tester = TQBandwidthTester(target_ip=args.ip, storage_units=args.shards, enable_profile=args.profile, 
