@@ -52,7 +52,7 @@ python run_benchmark.py --start_time 02:00 --cpus 30 --rounds 20
 
 **前提条件**:
 - 本机和远程节点已安装 Docker
-- 本机可通过 SSH 免密登录远程节点 (默认使用 `~/.ssh/id_rsa`)
+- 本机可通过 SSH 免密登录远程节点 (默认使用 `/root/.ssh/id_ed25519`)
 - 远程节点有权限运行 docker run
 
 ```bash
@@ -61,8 +61,8 @@ python run_benchmark.py \
   --worker-ip 192.168.1.101 \
   --cpus 30 \
   --rounds 20 \
-  --ssh-user ubuntu \
-  --deploy-path ~/tq_benchmark
+  --ssh-user root \
+  --deploy-path /tmp/tq_benchmark
 ```
 
 ### 4. 命令行参数
@@ -75,8 +75,8 @@ python run_benchmark.py \
 | `--shards` | 8 | 存储分片数量 |
 | `--output` | benchmark_summary.json | 结果输出文件 |
 | `--worker-ip` | - | **[双节点]** 远程 Worker 节点 IP (启用双节点模式) |
-| `--ssh-user` | 当前用户 | **[双节点]** SSH 用户名 |
-| `--deploy-path` | ~/tq_benchmark | **[双节点]** 远程代码部署路径 |
+| `--ssh-user` | root | **[双节点]** SSH 用户名 |
+| `--deploy-path` | /tmp/tq_benchmark | **[双节点]** 远程代码部署路径 |
 | `--start_time` | - | 定时启动 (格式: HH:MM) |
 
 ## 测试配置

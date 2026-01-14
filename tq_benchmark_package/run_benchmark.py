@@ -192,7 +192,7 @@ def deploy_and_run_worker(worker_ip, ssh_user, ssh_key, deploy_path, branch_conf
         f"--role worker "
         f"--head-ip {head_ip} "
         f"--worker-ip {worker_ip} "
-        f"--config {config_name} " # Just to pick the right params, though worker ignores benchmarking logic
+        f"--filter_config {config_name} " # Just to pick the right params
         f"--rounds {rounds} "
         f"--shards {shards} "
         f"--cpus {docker_cpu} "
@@ -222,9 +222,9 @@ def main():
     parser.add_argument("--role", type=str, default="single", choices=["single", "head", "worker"], help="Node role")
     parser.add_argument("--head-ip", type=str, help="Head node IP (required for worker)")
     parser.add_argument("--worker-ip", type=str, help="Worker node IP (for deployment or identification)")
-    parser.add_argument("--ssh-user", type=str, default=os.getlogin(), help="SSH user for remote deployment")
-    parser.add_argument("--ssh-key", type=str, default=os.path.expanduser("~/.ssh/id_rsa"), help="SSH key path")
-    parser.add_argument("--deploy-path", type=str, default="~/tq_benchmark_package", help="Remote deployment path")
+    parser.add_argument("--ssh-user", type=str, default="root", help="SSH user for remote deployment")
+    parser.add_argument("--ssh-key", type=str, default="/root/.ssh/id_ed25519", help="SSH key path")
+    parser.add_argument("--deploy-path", type=str, default="/tmp/tq_benchmark", help="Remote deployment path")
     parser.add_argument("--filter_branch", type=str, help="Filter specific branch config to run (internal use)")
 
     args = parser.parse_args()
