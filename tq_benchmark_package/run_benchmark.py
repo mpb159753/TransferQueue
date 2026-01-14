@@ -136,8 +136,8 @@ def run_single_benchmark_local(scenario, config_name, run_id, rounds, shards, cp
         # Worker connects to Head
         ray_start_cmd = f"ray start --address={head_ip}:{head_port} --node-ip-address={worker_ip} --num-cpus={int(cpu_limit)} --disable-usage-stats --block & sleep 5 && "
     elif role == "single":
-        # Single mode: start head locally
-        ray_start_cmd = f"ray start --head --port={head_port or 6379} --num-cpus={int(cpu_limit)} --include-dashboard=false --disable-usage-stats --block & sleep 5 && "
+        # Single mode: start head locally with specified port
+        ray_start_cmd = f"ray start --head --port={head_port} --num-cpus={int(cpu_limit)} --include-dashboard=false --disable-usage-stats --block & sleep 5 && "
 
     # Construct python command
     py_cmd_str = f"python scripts/put_benchmark.py --config {config_name} --rounds {rounds} --shards {shards} --role {role}"
@@ -152,8 +152,9 @@ def run_single_benchmark_local(scenario, config_name, run_id, rounds, shards, cp
     if worker_ip:
         py_cmd_str += f" --worker-ip {worker_ip}"
     
-    # Wrap in bash -c
-    final_cmd = ["/bin/bash", "-c", f"{ray_start_cmd}{py_cmd_str}"]
+    # Wrap in bash -c, and ensure ray stop is called at the end for cleanup
+    # Add sleep after ray stop to ensure ports are fully released before next test
+    final_cmd = ["/bin/bash", "-c", f"{ray_start_cmd}{py_cmd_str}; ray stop; sleep 2"]
     cmd.extend(final_cmd)
     
     print(f"Running {branch_config['name']} - {config_name} [Role: {role}]...")
@@ -274,7 +275,7 @@ def main():
         args.role = "head" 
     
     if args.role == "single" and not head_port:
-        head_port = 6379 # Default for single mode if not specified
+        head_port = get_free_port() # Use dynamic port for single mode to avoid conflicts
 
     if args.role == "worker" and not (args.head_ip and head_port):
          print("Error: Worker requires --head-ip and --head-port")
