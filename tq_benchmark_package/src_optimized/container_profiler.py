@@ -9,7 +9,7 @@ import glob
 # But standard docker image might not have psutil. We will use subprocess ps -ef.
 
 SAMPLING_RATE = 20
-OUTPUT_DIR = f"profile_results_{int(time.time())}"
+OUTPUT_DIR = os.environ.get("PROFILING_OUTPUT_DIR", f"profile_results_{int(time.time())}")
 
 def wait_for_flag(flag_name, main_pid):
     print(f"[Orchestrator] Waiting for {flag_name}...")
