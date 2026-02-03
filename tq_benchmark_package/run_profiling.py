@@ -11,12 +11,14 @@ DOCKER_IMAGE = "run_test"
 BRANCH_CONFIGS = [
     {"name": "optimized-zerocopy", "path": "tq_benchmark_package/src_optimized", "env": {"TQ_ZERO_COPY_SERIALIZATION": "true"}},
     {"name": "optimized-no-zerocopy", "path": "tq_benchmark_package/src_optimized", "env": {"TQ_ZERO_COPY_SERIALIZATION": "false"}},
+    {"name": "main-zerocopy", "path": "tq_benchmark_package/src_main", "env": {"TQ_ZERO_COPY_SERIALIZATION": "true"}},
+    {"name": "main-no-zerocopy", "path": "tq_benchmark_package/src_main", "env": {"TQ_ZERO_COPY_SERIALIZATION": "false"}},
 ]
 
-def run_profiling(config_name, round_count, branch_cfg, shards=8, cpu_limit=8):
+def run_profiling(config_name, round_count, branch_cfg, shards=8, cpu_limit=20):
     source_path = os.path.abspath(branch_cfg["path"])
     timestamp = int(time.time())
-    container_name = f"profile_{branch_cfg['name']}_{timestamp}"
+    container_name = f"profile_{branch_cfg['name']}_{config_name}_{timestamp}"
     
     # We must start 'container_profiler.py' inside via docker
     # Benchmark cmd: python put_benchmark.py ...
@@ -25,7 +27,7 @@ def run_profiling(config_name, round_count, branch_cfg, shards=8, cpu_limit=8):
         "--config", config_name, 
         "--rounds", str(round_count), 
         "--shards", str(shards),
-        "--output", f"res_{timestamp}.json",
+        "--output", f"res_{branch_cfg['name']}_{config_name}_{timestamp}.json",
         "--profile"  # Enable profiling synchronization
     ]
     
@@ -45,6 +47,9 @@ def run_profiling(config_name, round_count, branch_cfg, shards=8, cpu_limit=8):
     
     for k, v in branch_cfg["env"].items(): cmd.extend(["-e", f"{k}={v}"])
     
+    # Pass output directory to container
+    cmd.extend(["-e", f"PROFILING_OUTPUT_DIR={container_name}"])
+
     cmd.append(DOCKER_IMAGE)
     # Ensure py-spy is installed. If not, we might need to install it.
     # We prepend a pip install command if we are not sure. 

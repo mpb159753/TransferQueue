@@ -480,8 +480,11 @@ def main():
     # Initialize Ray
     current_working_dir = os.getcwd()
     if not ray.is_initialized():
-        # Always use auto because Ray is started by the wrapper script (run_benchmark.py) inside Docker
-        ray.init(address="auto", runtime_env={"working_dir": current_working_dir})
+        try:
+            ray.init(address="auto", runtime_env={"working_dir": current_working_dir})
+        except ConnectionError:
+            logger.info("Could not connect to existing Ray cluster, starting local instance...")
+            ray.init(runtime_env={"working_dir": current_working_dir})
 
     logger.info(f"Ray initialized. Role: {args.role}")
     

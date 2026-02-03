@@ -16,9 +16,9 @@ ALL_CONFIGS = ["debug", "tiny", "small", "medium", "large", "xlarge", "huge"]
 SHARD_VARIANTS = [8]
 
 BRANCH_CONFIGS = [
-    {"name": "optimized-v0.15", "path": "src_optimized", "env_vars": {}, "description": "Optimized"},
-    # {"name": "main-no-zerocopy", "path": "src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "false"}, "description": "No ZeroCopy"},
-    # {"name": "main-zerocopy", "path": "src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "true"}, "description": "ZeroCopy"},
+    {"name": "optimized-v0.15", "path": "tq_benchmark_package/src_optimized", "env_vars": {}, "description": "Optimized"},
+    {"name": "main-no-zerocopy", "path": "tq_benchmark_package/src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "false"}, "description": "No ZeroCopy"},
+    {"name": "main-zerocopy", "path": "tq_benchmark_package/src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "true"}, "description": "ZeroCopy"},
     # {"name": "tensordock", "path": "src_td", "env_vars": {}, "description": "TensorDock"},
 ]
 SCENARIOS = [{"name": "TransferQueue", "cmd_args": [], "env_vars": {"PYTHONPATH": "."}, "workdir": "."}]
