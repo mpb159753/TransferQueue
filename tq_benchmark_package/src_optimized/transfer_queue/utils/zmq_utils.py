@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import dataclasses
 import logging
 import os
+import pickle
 import socket
 import time
 from dataclasses import dataclass
@@ -25,11 +25,11 @@ from uuid import uuid4
 import psutil
 import zmq
 
-from transfer_queue.utils.serial_utils import PickleContainer, _decoder, _encoder
-from transfer_queue.utils.utils import (
-    ExplicitEnum,
-    TransferQueueRole,
+from transfer_queue.utils.common import (
+    get_env_bool,
 )
+from transfer_queue.utils.enum_utils import ExplicitEnum, TransferQueueRole
+from transfer_queue.utils.serial_utils import _decoder, _encoder
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
@@ -43,8 +43,14 @@ if not logger.hasHandlers():
 
 bytestr: TypeAlias = bytes | bytearray | memoryview
 
+TQ_ZERO_COPY_SERIALIZATION = get_env_bool("TQ_ZERO_COPY_SERIALIZATION", default=False)
+
 
 class ZMQRequestType(ExplicitEnum):
+    """
+    Enumerate all available request types in TransferQueue.
+    """
+
     # HANDSHAKE
     HANDSHAKE = "HANDSHAKE"  # TransferQueueStorageUnit -> TransferQueueController
     HANDSHAKE_ACK = "HANDSHAKE_ACK"  # TransferQueueController  -> TransferQueueStorageUnit
@@ -73,12 +79,12 @@ class ZMQRequestType(ExplicitEnum):
     CLEAR_PARTITION = "CLEAR_PARTITION"
     CLEAR_PARTITION_RESPONSE = "CLEAR_PARTITION_RESPONSE"
 
-    # CHECK_CONSUMPTION
-    CHECK_CONSUMPTION = "CHECK_CONSUMPTION"
+    # GET_CONSUMPTION
+    GET_CONSUMPTION = "GET_CONSUMPTION"
     CONSUMPTION_RESPONSE = "CONSUMPTION_RESPONSE"
 
-    # CHECK_PRODUCTION
-    CHECK_PRODUCTION = "CHECK_PRODUCTION"
+    # GET_PRODUCTION
+    GET_PRODUCTION = "GET_PRODUCTION"
     PRODUCTION_RESPONSE = "PRODUCTION_RESPONSE"
 
     # LIST_PARTITIONS
@@ -92,6 +98,10 @@ class ZMQRequestType(ExplicitEnum):
 
 
 class ZMQServerInfo:
+    """
+    TransferQueue server info class.
+    """
+
     def __init__(self, role: TransferQueueRole, id: str, ip: str, ports: dict[str, str]):
         self.role = role
         self.id = id
@@ -99,9 +109,11 @@ class ZMQServerInfo:
         self.ports = ports
 
     def to_addr(self, port_name: str) -> str:
+        """Convert zmq port name to address string."""
         return f"tcp://{self.ip}:{self.ports[port_name]}"
 
     def to_dict(self):
+        """Convert ZMQServerInfo to dict."""
         return {
             "role": self.role,
             "id": self.id,
@@ -115,6 +127,10 @@ class ZMQServerInfo:
 
 @dataclass
 class ZMQMessage:
+    """
+    ZMQMessage class for TransferQueue communication.
+    """
+
     request_type: ZMQRequestType
     sender_id: str
     receiver_id: str | None
@@ -130,6 +146,7 @@ class ZMQMessage:
         body: dict[str, Any],
         receiver_id: Optional[str] = None,
     ) -> "ZMQMessage":
+        """Create ZMQMessage."""
         return cls(
             request_type=request_type,
             sender_id=sender_id,
@@ -141,55 +158,46 @@ class ZMQMessage:
 
     def serialize(self) -> list:
         """
-        Serialize message using unified MsgpackEncoder.
-        Returns: list[bytestr] - [msgpack_header, *tensor_buffers]
+        Serialize message using unified MsgpackEncoder or pickle.
+        Returns: list[bytestr] - [msgpack_header, *tensor_buffers] or [bytes]
         """
-        msg_dict = {
-            "request_type": self.request_type.value,  # Enum -> str for msgpack
-            "sender_id": self.sender_id,
-            "receiver_id": self.receiver_id,
-            "request_id": self.request_id,
-            "timestamp": self.timestamp,
-            "timestamp": self.timestamp,
-            "body": self._wrap_dataclasses(self.body),
-        }
-        return list(_encoder.encode(msg_dict))
-
-    def _wrap_dataclasses(self, obj: Any) -> Any:
-        """
-        Recursively traverse the object tree. If a dataclass instance is found,
-        wrap it in PickleContainer(obj).
-        """
-        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-            return PickleContainer(obj)
-        elif isinstance(obj, dict):
-            return {k: self._wrap_dataclasses(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [self._wrap_dataclasses(item) for item in obj]
-        elif isinstance(obj, tuple):
-            return tuple(self._wrap_dataclasses(item) for item in obj)
-        return obj
+        if TQ_ZERO_COPY_SERIALIZATION:
+            msg_dict = {
+                "request_type": self.request_type.value,  # Enum -> str for msgpack
+                "sender_id": self.sender_id,
+                "receiver_id": self.receiver_id,
+                "request_id": self.request_id,
+                "timestamp": self.timestamp,
+                "body": self.body,
+            }
+            return list(_encoder.encode(msg_dict))
+        else:
+            return [pickle.dumps(self)]
 
     @classmethod
     def deserialize(cls, frames: list) -> "ZMQMessage":
         """
-        Deserialize message using unified MsgpackDecoder.
+        Deserialize message using unified MsgpackDecoder or pickle.
         """
         if not frames:
             raise ValueError("Empty frames received")
 
-        msg_dict = _decoder.decode(frames)
-        return cls(
-            request_type=ZMQRequestType(msg_dict["request_type"]),
-            sender_id=msg_dict["sender_id"],
-            receiver_id=msg_dict["receiver_id"],
-            body=msg_dict["body"],
-            request_id=msg_dict["request_id"],
-            timestamp=msg_dict["timestamp"],
-        )
+        if TQ_ZERO_COPY_SERIALIZATION:
+            msg_dict = _decoder.decode(frames)
+            return cls(
+                request_type=ZMQRequestType(msg_dict["request_type"]),
+                sender_id=msg_dict["sender_id"],
+                receiver_id=msg_dict["receiver_id"],
+                body=msg_dict["body"],
+                request_id=msg_dict["request_id"],
+                timestamp=msg_dict["timestamp"],
+            )
+        else:
+            return pickle.loads(frames[0])
 
 
 def get_free_port() -> str:
+    """Get free port of the host."""
     with socket.socket() as sock:
         sock.bind(("", 0))
         return sock.getsockname()[1]
@@ -200,6 +208,7 @@ def create_zmq_socket(
     socket_type: Any,
     identity: Optional[bytestr] = None,
 ) -> zmq.Socket:
+    """Create ZMQ socket."""
     mem = psutil.virtual_memory()
     socket = ctx.socket(socket_type)
 

@@ -17,10 +17,13 @@ import itertools
 import logging
 import os
 import time
+import weakref
 from abc import ABC, abstractmethod
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Optional
 from uuid import uuid4
 
+import ray
 import torch
 import zmq
 from tensordict import NonTensorStack, TensorDict
@@ -46,6 +49,9 @@ TQ_STORAGE_HANDSHAKE_RETRY_INTERVAL = int(os.environ.get("TQ_STORAGE_HANDSHAKE_R
 TQ_STORAGE_HANDSHAKE_MAX_RETRIES = int(os.environ.get("TQ_STORAGE_HANDSHAKE_MAX_RETRIES", 3))
 TQ_DATA_UPDATE_RESPONSE_TIMEOUT = int(os.environ.get("TQ_DATA_UPDATE_RESPONSE_TIMEOUT", 30))
 
+LIMIT_THREADS_PER_MANAGER_IN_DRIVER = 8
+LIMIT_THREADS_PER_MANAGER_IN_RAY_ACTOR = 4
+
 
 class TransferQueueStorageManager(ABC):
     """Base class for storage layer. It defines the interface for data operations and
@@ -54,12 +60,14 @@ class TransferQueueStorageManager(ABC):
     def __init__(self, config: dict[str, Any]):
         self.storage_manager_id = f"TQ_STORAGE_{uuid4().hex[:8]}"
         self.config = config
-        self.controller_info = config.get("controller_info", None)  # type: ZMQServerInfo
+        controller_info = config.get("controller_info")
+        assert controller_info is not None, "controller_info is required"
+        self.controller_info: ZMQServerInfo = controller_info
 
-        self.data_status_update_socket = None
-        self.controller_handshake_socket = None
+        self.data_status_update_socket: Optional[zmq.Socket[bytes]] = None
+        self.controller_handshake_socket: Optional[zmq.Socket[bytes]] = None
 
-        self.zmq_context = None
+        self.zmq_context: Optional[zmq.Context[Any]] = None
         self._connect_to_controller()
 
     def _connect_to_controller(self) -> None:
@@ -82,6 +90,7 @@ class TransferQueueStorageManager(ABC):
                 zmq.DEALER,
                 identity=f"{self.storage_manager_id}-data_status_update_socket-{uuid4().hex[:8]}".encode(),
             )
+            assert self.data_status_update_socket is not None, "data_status_update_socket is not properly initialized"
             self.data_status_update_socket.connect(self.controller_info.to_addr("data_status_update_socket"))
 
             # do handshake with controller
@@ -100,6 +109,7 @@ class TransferQueueStorageManager(ABC):
         # Create zmq poller for handshake confirmation between controller and storage manager
         poller = zmq.Poller()
 
+        assert self.controller_handshake_socket is not None, "controller_handshake_socket is not properly initialized"
         self.controller_handshake_socket.connect(self.controller_info.to_addr("handshake_socket"))
         logger.debug(
             f"[{self.storage_manager_id}]: Handshake connection from storage manager id #{self.storage_manager_id} "
@@ -164,6 +174,7 @@ class TransferQueueStorageManager(ABC):
 
     def _send_handshake_requests(self) -> None:
         """Send handshake request to controller."""
+        assert self.controller_handshake_socket is not None, "controller_handshake_socket is not properly initialized"
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.HANDSHAKE,
             sender_id=self.storage_manager_id,
@@ -183,8 +194,8 @@ class TransferQueueStorageManager(ABC):
         partition_id: str,
         fields: list[str],
         global_indexes: list[int],
-        dtypes: dict[int, dict[str, Any]],
-        shapes: dict[int, dict[str, Any]],
+        field_schema: Optional[dict[str, dict[str, Any]]] = None,
+        custom_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> None:
         """
         Notify controller that new data is ready.
@@ -193,8 +204,8 @@ class TransferQueueStorageManager(ABC):
             partition_id: Current data partition id.
             fields: Data update related fields.
             global_indexes: Data update related global_indexes.
-            dtypes: Per-field dtypes for each field, in {global_index: {field: dtype}} format.
-            shapes: Per-field shapes for each field, in {global_index: {field: shape}} format.
+            field_schema: Field-level metadata {field_name: {dtype, shape, is_nested, is_non_tensor}}.
+            custom_meta: Per-field custom_meta for each field, in {global_index: {field: custom_meta}} format.
         """
         # Create zmq poller for notifying data update information
 
@@ -205,6 +216,7 @@ class TransferQueueStorageManager(ABC):
         # Create zmq poller for notifying data update information
         poller = zmq.Poller()
         # Note: data_status_update_socket is already connected during initialization
+        assert self.data_status_update_socket is not None, "data_status_update_socket is not properly initialized"
 
         try:
             poller.register(self.data_status_update_socket, zmq.POLLIN)
@@ -216,8 +228,8 @@ class TransferQueueStorageManager(ABC):
                     "partition_id": partition_id,
                     "fields": fields,
                     "global_indexes": global_indexes,
-                    "dtypes": dtypes,
-                    "shapes": shapes,
+                    "field_schema": field_schema,
+                    "custom_meta": custom_meta,
                 },
             ).serialize()
 
@@ -269,14 +281,36 @@ class TransferQueueStorageManager(ABC):
 
     @abstractmethod
     async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
+        """
+        Put data into the storage backend.
+
+        Args:
+            data: Data to be put into the storage.
+            metadata: BatchMeta of the corresponding data.
+        """
         raise NotImplementedError("Subclasses must implement put_data")
 
     @abstractmethod
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
+        """
+        Get data from the storage backend.
+
+        Args:
+            metadata: BatchMeta of the data to be retrieved from the storage.
+
+        Returns:
+            TensorDict containing the data retrieved from the storage.
+        """
         raise NotImplementedError("Subclasses must implement get_data")
 
     @abstractmethod
     async def clear_data(self, metadata: BatchMeta) -> None:
+        """
+        Clear data from the storage backend.
+
+        Args:
+            metadata: BatchMeta of the data to be cleared from the storage.
+        """
         raise NotImplementedError("Subclasses must implement clear_data")
 
     def close(self) -> None:
@@ -321,6 +355,9 @@ class KVStorageManager(TransferQueueStorageManager):
             raise ValueError("Missing client_name in config")
         super().__init__(config)
         self.storage_client = StorageClientFactory.create(client_name, config)
+        self._multi_threads_executor: Optional[ThreadPoolExecutor] = None
+        # Register a cleanup function: automatically invoke shutdown when the instance is garbage collected.
+        self._executor_finalizer = weakref.finalize(self, self._shutdown_executor, self._multi_threads_executor)
 
     @staticmethod
     def _generate_keys(field_names: list[str], global_indexes: list[int]) -> list[str]:
@@ -335,7 +372,10 @@ class KVStorageManager(TransferQueueStorageManager):
         Returns:
             list[str]: List of keys, e.g., ['0@field_a', '1@field_a', '0@field_b', ...]
         """
-        return [f"{index}@{field}" for field, index in itertools.product(sorted(field_names), global_indexes)]
+        sorted_fields = sorted(field_names)
+        keys_suffixes = ["@" + f for f in sorted_fields]
+        keys_prefixes = [f"{i}" for i in global_indexes]
+        return [pfx + sfx for sfx, pfx in itertools.product(keys_suffixes, keys_prefixes)]
 
     @staticmethod
     def _generate_values(data: TensorDict) -> list[Tensor]:
@@ -353,7 +393,41 @@ class KVStorageManager(TransferQueueStorageManager):
         return [row_data for field in sorted(data.keys()) for row_data in data[field]]
 
     @staticmethod
-    def _merge_tensors_to_tensordict(metadata: BatchMeta, values: list[Tensor]) -> TensorDict:
+    def _shutdown_executor(thread_executor: Optional[ThreadPoolExecutor]) -> None:
+        """
+        A static method to ensure no strong reference to 'self' is held within the
+        finalizer's callback, enabling proper garbage collection.
+        """
+        if thread_executor:
+            thread_executor.shutdown(wait=False)
+
+    def _get_executor(self) -> ThreadPoolExecutor:
+        """Lazy Creating multi-thread executor for speeding up '_merge_tensors_to_tensordict'"""
+        if self._multi_threads_executor is None:
+            ray_context = ray.get_runtime_context()
+            is_in_ray_actor_or_task = ray_context.get_actor_id() is not None or ray_context.get_task_id() is not None
+
+            if is_in_ray_actor_or_task:
+                # In ray actor:
+                ray_assigned_cpus = ray_context.get_assigned_resources().get("CPU", 1)
+                # num_threads must be 2 at least.
+                num_threads = max(2, int(ray_assigned_cpus))
+                num_threads = min(num_threads, LIMIT_THREADS_PER_MANAGER_IN_RAY_ACTOR)
+            else:
+                # In Driver:
+                # num_threads must be 2 at least.
+                num_threads = max(2, os.cpu_count() or 2)
+                num_threads = min(num_threads, LIMIT_THREADS_PER_MANAGER_IN_DRIVER)
+
+            self._num_threads = num_threads
+            self._multi_threads_executor = ThreadPoolExecutor(
+                max_workers=self._num_threads, thread_name_prefix="KVStorageManager"
+            )
+
+        assert self._multi_threads_executor is not None
+        return self._multi_threads_executor
+
+    def _merge_tensors_to_tensordict(self, metadata: BatchMeta, values: list[Tensor]) -> TensorDict:
         """
         Reconstruct a TensorDict from a list of values using metadata.
         The values list is assumed to be in the same order as keys generated by `_generate_keys`.
@@ -367,77 +441,116 @@ class KVStorageManager(TransferQueueStorageManager):
         Returns:
             TensorDict: Reconstructed tensor dictionary with batch size equal to number of samples.
         """
-        global_indexes = metadata.global_indexes
+        num_samples = len(metadata.global_indexes)
         field_names = sorted(metadata.field_names)
-        expected_length = len(global_indexes) * len(field_names)
+        num_fields = len(field_names)
+        expected_length = num_samples * num_fields
         if len(values) != expected_length:
             raise ValueError(f"Length of values ({len(values)}) does not match expected ({expected_length})")
 
-        if len(values) == 0:
-            return TensorDict({}, batch_size=len(global_indexes))
+        if not values:
+            return TensorDict({}, batch_size=num_samples)
 
-        grouped_data: dict[str, list[Tensor]] = {field: [] for field in field_names}
+        def process_field(field_idx: int):
+            """
+            for each field:
+            1. compute chunk (Each chunk is a slice of the values list
+                and All data in the chunk belong to the same field of tensordict.)
+            2. if first or last value of chunk is not tensor, use NonTensorStack
+            3. if the first and the last has the same shape, try torch.stack
+            4. if failed, try as_nested_tensor
+            5. if failed, finally use NonTensorStack
 
-        # Group values by field_name
-        # TODO: Performance optimize
-        value_idx = 0
-        for field in field_names:
-            for _ in range(len(global_indexes)):
-                grouped_data[field].append(values[value_idx])
-                value_idx += 1
+            note: we use first value and last value to Estimate the situation of the entire chunk.
+            """
+            field = field_names[field_idx]
+            chunk = values[field_idx * num_samples : (field_idx + 1) * num_samples]
+            if not chunk:
+                return field, None
+            first_value, last_value = chunk[0], chunk[-1]
 
-        # Stack or nest tensors per field
-        # TODO: These codes about data merging will serve as a general function
-        merged_data = {}
-        for field, data_list in grouped_data.items():
-            if all(isinstance(item, torch.Tensor) for item in data_list):
+            if not (isinstance(first_value, torch.Tensor) and isinstance(last_value, torch.Tensor)):
+                return field, NonTensorStack(*chunk)
+
+            if first_value.shape == last_value.shape:
                 try:
-                    merged_data[field] = torch.stack(data_list)
-                except RuntimeError:
-                    try:
-                        # Fallback to nested tensor if shapes are irregular
-                        merged_data[field] = torch.nested.as_nested_tensor(data_list)
-                    except Exception:
-                        merged_data[field] = NonTensorStack(*data_list)
-            else:
-                merged_data[field] = NonTensorStack(*data_list)
+                    return field, torch.stack(chunk)
+                except (RuntimeError, TypeError):
+                    pass
 
-        return TensorDict(merged_data, batch_size=len(global_indexes))
+            try:
+                return field, torch.nested.as_nested_tensor(chunk, layout=torch.jagged)
+            except (RuntimeError, TypeError):
+                return field, NonTensorStack(*chunk)
+
+        executor = self._get_executor()
+        use_multi_threads = num_fields > 1 and executor is not None
+        if use_multi_threads:
+            # Prioritize processing fields with larger tensor sizes to improve parallel efficiency
+            field_sizes = []
+            for i in range(num_fields):
+                # Estimate size based on the first value
+                _first_value = values[i * num_samples]
+                if isinstance(_first_value, torch.Tensor):
+                    size = _first_value.nelement() * _first_value.element_size()
+                else:
+                    size = 0
+                field_sizes.append(size)
+            indexed_tasks = sorted(range(num_fields), key=lambda i: field_sizes[i], reverse=True)
+            results = list(executor.map(process_field, indexed_tasks))
+        else:
+            results = [process_field(i) for i in range(num_fields)]
+
+        merged_data = {field: data for field, data in results if data is not None}
+        return TensorDict(merged_data, batch_size=num_samples)
 
     @staticmethod
-    def _get_shape_type_list(metadata: BatchMeta):
+    def _get_shape_type_custom_meta_list(metadata: BatchMeta):
         """
-        Extract the expected shape and dtype for each field-sample pair in metadata.
+        Extract the expected shape, dtype, and custom meta for each field-sample pair in metadata.
         The order matches the key/value order: sorted by field name, then by global index.
+
+        O(F) optimized version that uses field_schema instead of per-sample metadata.
 
         Args:
             metadata (BatchMeta): Metadata containing sample and field information.
         Returns:
-            tuple[list[torch.Size], list[torch.dtype]]: Two lists containing the shape and dtype
-            for each tensor to be retrieved.
+            tuple[list[torch.Size], list[torch.dtype], list[Any]]: the shape list, dtype list and
+            custom meta list for each tensor to be retrieved.
         """
         shapes = []
         dtypes = []
+        custom_meta_list = []
+        all_custom_meta = metadata.get_all_custom_meta()
+        num_samples = len(metadata)
+
         for field_name in sorted(metadata.field_names):
-            for index in range(len(metadata)):
-                field = metadata.samples[index].get_field_by_name(field_name)
-                shapes.append(field.shape)
-                dtypes.append(field.dtype)
-        return shapes, dtypes
+            field_meta = metadata.field_schema.get(field_name, {})
+            field_shape = field_meta.get("shape")
+            field_dtype = field_meta.get("dtype")
+            per_sample_shapes = field_meta.get("per_sample_shapes")
+
+            for index in range(num_samples):
+                # Use per_sample_shapes if available (for nested tensors), otherwise use field-level shape
+                if per_sample_shapes is not None:
+                    shapes.append(per_sample_shapes[index])
+                else:
+                    shapes.append(field_shape)
+                dtypes.append(field_dtype)
+                global_index = metadata.global_indexes[index]
+                custom_meta_list.append(all_custom_meta.get(global_index, {}).get(field_name, None))
+        return shapes, dtypes, custom_meta_list
 
     async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
         """
         Store tensor data in the backend storage and notify the controller.
 
-        Serializes the input tensors, stores them using the storage client,
-        extracts per-sample dtype and shape information, and sends a notification
-        to the controller that new data is available.
+        O(F) optimized version that extracts field-level schema instead of per-sample metadata.
         """
         if not metadata.field_names:
             logger.warning("Attempted to put data, but metadata contains no fields.")
             return
 
-        # For each field, extract dtype and shape for each sample
         num_samples = len(metadata.global_indexes)
         if num_samples == 0:
             return
@@ -445,34 +558,62 @@ class KVStorageManager(TransferQueueStorageManager):
         keys = self._generate_keys(data.keys(), metadata.global_indexes)
         values = self._generate_values(data)
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.storage_client.put, keys, values)
+        custom_meta = await loop.run_in_executor(None, self.storage_client.put, keys, values)
 
-        per_field_dtypes = {}
-        per_field_shapes = {}
-
-        # Initialize the data structure for each global index
-        for global_idx in metadata.global_indexes:
-            per_field_dtypes[global_idx] = {}
-            per_field_shapes[global_idx] = {}
-
+        # O(F): Extract field-level schema by sampling the first item
+        field_schema: dict[str, dict[str, Any]] = {}
         for field_name, field_data in data.items():
-            for i in range(num_samples):
-                data_item = field_data[i]
-                global_idx = metadata.global_indexes[i]
-                per_field_dtypes[global_idx][field_name] = (
-                    getattr(data_item, "dtype", None) if isinstance(data_item, Tensor) else None
-                )
-                per_field_shapes[global_idx][field_name] = (
-                    getattr(data_item, "shape", None) if isinstance(data_item, Tensor) else None
-                )
+            first_item = field_data[0] if len(field_data) > 0 else None
+
+            # Determine if this is a nested tensor
+            is_nested = isinstance(field_data, torch.Tensor) and field_data.is_nested
+
+            # Determine if this is non-tensor data
+            is_non_tensor = not isinstance(first_item, Tensor) if first_item is not None else False
+
+            field_meta = {
+                "dtype": getattr(first_item, "dtype", type(first_item) if first_item is not None else None),
+                "shape": getattr(first_item, "shape", None)
+                if not is_nested and isinstance(first_item, Tensor)
+                else None,
+                "is_nested": is_nested,
+                "is_non_tensor": is_non_tensor,
+            }
+
+            # For nested tensors, record per-sample shapes
+            if is_nested:
+                field_meta["per_sample_shapes"] = [tuple(t.shape) for t in field_data.unbind()]
+
+            field_schema[field_name] = field_meta
+
+        # Prepare per-field custom_meta if available
+        per_field_custom_meta: dict[int, dict[str, Any]] = {}
+        if custom_meta:
+            if len(custom_meta) != len(keys):
+                raise ValueError(f"Length of custom_meta ({len(custom_meta)}) does not match expected ({len(keys)})")
+            # custom meta is a flat list aligned with keys/values
+            # Use itertools.product to eliminate nested loops
+            for global_idx in metadata.global_indexes:
+                per_field_custom_meta[global_idx] = {}
+
+            # TODO(tianyi): the order of custom meta is coupled with keys/values
+            for (field_name, global_idx), meta_value in zip(
+                itertools.product(sorted(metadata.field_names), metadata.global_indexes),
+                custom_meta,
+                strict=True,
+            ):
+                per_field_custom_meta[global_idx][field_name] = meta_value
+            metadata.update_custom_meta(per_field_custom_meta)
 
         # Get current data partition id
-        # Note: Currently we only support putting to & getting data from a single data partition simultaneously,
-        # but in the future we may support putting to & getting data from multiple data partitions concurrently.
-        partition_id = metadata.samples[0].partition_id
+        partition_id = metadata.partition_ids[0]
         # notify controller that new data is ready
         await self.notify_data_update(
-            partition_id, list(data.keys()), metadata.global_indexes, per_field_dtypes, per_field_shapes
+            partition_id,
+            list(data.keys()),
+            metadata.global_indexes,
+            field_schema,
+            per_field_custom_meta,
         )
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
@@ -486,8 +627,8 @@ class KVStorageManager(TransferQueueStorageManager):
             logger.warning("Attempted to get data, but metadata contains no fields.")
             return TensorDict({}, batch_size=len(metadata))
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
-        shapes, dtypes = self._get_shape_type_list(metadata)
-        values = self.storage_client.get(keys=keys, shapes=shapes, dtypes=dtypes)
+        shapes, dtypes, custom_meta = self._get_shape_type_custom_meta_list(metadata)
+        values = self.storage_client.get(keys=keys, shapes=shapes, dtypes=dtypes, custom_meta=custom_meta)
         return self._merge_tensors_to_tensordict(metadata, values)
 
     async def clear_data(self, metadata: BatchMeta) -> None:

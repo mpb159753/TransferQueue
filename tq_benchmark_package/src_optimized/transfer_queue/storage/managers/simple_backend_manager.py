@@ -30,6 +30,7 @@ from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers.base import TransferQueueStorageManager
 from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
 from transfer_queue.storage.simple_backend import StorageMetaGroup
+from transfer_queue.utils.common import get_env_bool
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,8 @@ if not logger.hasHandlers():
 TQ_SIMPLE_STORAGE_MANAGER_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_MANAGER_RECV_TIMEOUT", 200))  # seconds
 TQ_SIMPLE_STORAGE_MANAGER_SEND_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_MANAGER_SEND_TIMEOUT", 200))  # seconds
 
+TQ_ZERO_COPY_SERIALIZATION = get_env_bool("TQ_ZERO_COPY_SERIALIZATION", default=False)
+
 
 @TransferQueueStorageManagerFactory.register("AsyncSimpleStorageManager")
 class AsyncSimpleStorageManager(TransferQueueStorageManager):
@@ -57,13 +60,14 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         super().__init__(config)
 
         self.config = config
-        server_infos = config.get("storage_unit_infos", None)  # type: ZMQServerInfo | dict[str, ZMQServerInfo]
+        server_infos: ZMQServerInfo | dict[str, ZMQServerInfo] | None = config.get("storage_unit_infos", None)
 
         if server_infos is None:
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'storage_unit_infos' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
         self._build_storage_mapping_functions()
+        self._batch_counter = 0  # Cross-batch rotation counter for load balancing
 
     def _register_servers(self, server_infos: "ZMQServerInfo | dict[Any, ZMQServerInfo]"):
         """Register and validate server information.
@@ -93,13 +97,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         return server_infos_transform
 
     def _build_storage_mapping_functions(self):
-        """Build mapping functions for global index to storage unit and local index.
-
-        Creates round-robin mapping functions to distribute data across storage units.
-        """
-        self.global_index_storage_unit_mapping = lambda x: list(self.storage_unit_infos.keys())[
-            x % len(self.storage_unit_infos)
-        ]
+        """Build mapping function for global index to local index."""
         self.global_index_local_index_mapping = lambda x: x // len(self.storage_unit_infos)
 
     # TODO (TQStorage): Provide a general dynamic socket function for both Client & Storage @huazhong.
@@ -175,6 +173,9 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         """
         Send data to remote StorageUnit based on metadata.
 
+        Optimized version using TensorDict slicing and unified async processing.
+        Complexity: O(F) for schema extraction + O(S) for data distribution.
+
         Args:
             data: TensorDict containing the data to store.
             metadata: BatchMeta containing storage location information.
@@ -182,46 +183,130 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         logger.debug(f"[{self.storage_manager_id}]: receive put_data request, putting {metadata.size} samples.")
 
-        # group samples by storage unit
-        storage_meta_groups = build_storage_meta_groups(
-            metadata, self.global_index_storage_unit_mapping, self.global_index_local_index_mapping
-        )
+        storage_unit_keys = list(self.storage_unit_infos.keys())
+        num_units = len(storage_unit_keys)
+        batch_size = metadata.size
 
-        # send data to each storage unit
+        if batch_size == 0:
+            return
+
+        # Calculate block allocation parameters
+        chunk_size = (batch_size + num_units - 1) // num_units
+        start_offset = self._batch_counter % num_units
+        self._batch_counter += 1
+
+        # Phase 1: Extract field schema (O(F))
+        field_schema = self._extract_field_schema(data)
+
+        # Phase 2: Parallel send to all StorageUnits
         tasks = [
-            self._put_to_single_storage_unit(
-                meta_group.get_local_indexes(), _filter_storage_data(meta_group, data), target_storage_unit=storage_id
+            self._prepare_and_send_to_unit(
+                unit_idx=unit_idx,
+                storage_id=storage_id,
+                chunk_size=chunk_size,
+                batch_size=batch_size,
+                start_offset=start_offset,
+                num_units=num_units,
+                data=data,
+                metadata=metadata,
             )
-            for storage_id, meta_group in storage_meta_groups.items()
+            for unit_idx, storage_id in enumerate(storage_unit_keys)
         ]
+
         await asyncio.gather(*tasks)
 
-        # Gather per-field dtype and shape information for each field
-        # global_indexes, local_indexes, and field_data correspond one-to-one
-        per_field_dtypes = {}
-        per_field_shapes = {}
+        # Phase 3: Notify controller
+        partition_id = metadata.partition_ids[0]
+        await self.notify_data_update(partition_id, list(data.keys()), metadata.global_indexes, field_schema)
 
-        # Initialize the data structure for each global index
-        for global_idx in metadata.global_indexes:
-            per_field_dtypes[global_idx] = {}
-            per_field_shapes[global_idx] = {}
+    async def _prepare_and_send_to_unit(
+        self,
+        unit_idx: int,
+        storage_id: str,
+        chunk_size: int,
+        batch_size: int,
+        start_offset: int,
+        num_units: int,
+        data: TensorDict,
+        metadata: BatchMeta,
+    ) -> None:
+        """Prepare data slice and send to a single storage unit.
 
-        # For each field, extract dtype and shape for each sample
-        for field in data.keys():
-            for i, data_item in enumerate(data[field]):
-                global_idx = metadata.global_indexes[i]
-                per_field_dtypes[global_idx][field] = data_item.dtype if hasattr(data_item, "dtype") else None
-                per_field_shapes[global_idx][field] = data_item.shape if hasattr(data_item, "shape") else None
+        All operations use O(1) slicing. Returns early if this unit has no data assigned.
+        """
+        # Calculate rotated index for load balancing
+        rotated_idx = (unit_idx - start_offset) % num_units
+        start = rotated_idx * chunk_size
+        end = min((rotated_idx + 1) * chunk_size, batch_size)
 
-        # Get current data partition id
-        # Note: Currently we only support putting to & getting data from a single data partition simultaneously,
-        # but in the future we may support putting to & getting data from multiple data partitions concurrently.
-        partition_id = metadata.samples[0].partition_id
+        # Skip if this unit has no data assigned
+        if start >= batch_size or start >= end:
+            return
 
-        # notify controller that new data is ready
-        await self.notify_data_update(
-            partition_id, list(data.keys()), metadata.global_indexes, per_field_dtypes, per_field_shapes
-        )
+        # Calculate local_indexes
+        global_indexes_slice = metadata.global_indexes[start:end]
+        local_indexes = [self.global_index_local_index_mapping(gi) for gi in global_indexes_slice]
+
+        # Data slicing - O(1) operation for both Tensor and NonTensorStack
+        # Special handling for NestedTensor on CPU which doesn't support slice
+        storage_data = {}
+        for fname in data.keys():
+            field_data = data[fname]
+            if isinstance(field_data, torch.Tensor) and field_data.is_nested:
+                # Unbind to list of tensors, then slice the list
+                unbound = field_data.unbind()
+                storage_data[fname] = unbound[start:end]
+            else:
+                # Regular slicing
+                storage_data[fname] = field_data[start:end]
+
+        # Clone if not using zero-copy serialization
+        if not TQ_ZERO_COPY_SERIALIZATION:
+            storage_data = {
+                fname: (field_data.clone() if isinstance(field_data, torch.Tensor) else field_data)
+                for fname, field_data in storage_data.items()
+            }
+
+        await self._put_to_single_storage_unit(local_indexes, storage_data, target_storage_unit=storage_id)
+
+    def _extract_field_schema(self, data: TensorDict) -> dict[str, dict[str, Any]]:
+        """Extract field-level schema from TensorDict. O(F) complexity."""
+        field_schema: dict[str, dict[str, Any]] = {}
+
+        for field_name in data.keys():
+            field_data = data[field_name]
+
+            # Check if it's a tensor and if it's nested BEFORE trying len()
+            is_tensor = isinstance(field_data, torch.Tensor)
+            is_nested = is_tensor and field_data.is_nested
+
+            # For NestedTensor, use unbind() to get elements; for others, use indexing
+            if is_nested:
+                # NestedTensor doesn't support len() or indexing, use unbind()
+                unbound = field_data.unbind()
+                first_item = unbound[0] if unbound else None
+            elif is_tensor:
+                # Regular tensor: check size via shape[0]
+                first_item = field_data[0] if field_data.shape[0] > 0 else None
+            else:
+                # NonTensorStack or other: use len() safely
+                first_item = field_data[0] if len(field_data) > 0 else None
+
+            is_non_tensor = not isinstance(first_item, torch.Tensor) if first_item is not None else False
+
+            field_meta = {
+                "dtype": getattr(first_item, "dtype", type(first_item) if first_item is not None else None),
+                "shape": getattr(first_item, "shape", None) if is_tensor and not is_nested else None,
+                "is_nested": is_nested,
+                "is_non_tensor": is_non_tensor,
+            }
+
+            if is_nested:
+                field_meta["per_sample_shapes"] = [tuple(t.shape) for t in unbound]
+
+            field_schema[field_name] = field_meta
+
+        return field_schema
 
     @dynamic_storage_manager_socket(socket_name="put_get_socket")
     async def _put_to_single_storage_unit(
@@ -236,7 +321,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         """
 
         request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.PUT_DATA,
+            request_type=ZMQRequestType.PUT_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
             body={"local_indexes": local_indexes, "data": storage_data},
@@ -269,9 +354,12 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         logger.debug(f"[{self.storage_manager_id}]: receive get_data request, getting {metadata.size} samples.")
 
-        # group samples by storage unit
+        # Group samples by storage unit using block allocation
+        storage_unit_keys = list(self.storage_unit_infos.keys())
         storage_meta_groups = build_storage_meta_groups(
-            metadata, self.global_index_storage_unit_mapping, self.global_index_local_index_mapping
+            metadata,
+            storage_unit_keys,
+            self.global_index_local_index_mapping,
         )
 
         # retrive data
@@ -284,7 +372,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         # post-process data segments to generate a batch of data
         merged_data: dict[int, dict[str, torch.Tensor]] = {}
-        for global_indexes, fields, data_from_single_storage_unit in results:
+        for global_indexes, fields, data_from_single_storage_unit, messages in results:
             field_getter = itemgetter(*fields)
             field_values = field_getter(data_from_single_storage_unit)
 
@@ -302,14 +390,17 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         for field in metadata.field_names:
             ordered_data[field] = [merged_data[global_idx][field] for global_idx in metadata.global_indexes]
 
+        # In the final packing stage we intentionally perform a memory copy through torch.stack and as_nested_tensor.
+        # This detaches the received tensors from the original zero‑copy buffers,
+        # gives them their own lifetime, and ensures the resulting tensors are writable.
         tensor_data = {
             field: (
-                torch.stack(torch.nested.as_nested_tensor(v).unbind())
+                torch.stack(v)
                 if v
                 and all(isinstance(item, torch.Tensor) for item in v)
                 and all(item.shape == v[0].shape for item in v)
                 else (
-                    torch.nested.as_nested_tensor(v)
+                    torch.nested.as_nested_tensor(v, layout=torch.jagged)
                     if v and all(isinstance(item, torch.Tensor) for item in v)
                     else NonTensorStack(*v)
                 )
@@ -328,7 +419,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         fields = storage_meta_group.get_field_names()
 
         request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.GET_DATA,
+            request_type=ZMQRequestType.GET_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
             body={"local_indexes": local_indexes, "fields": fields},
@@ -340,8 +431,10 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
             if response_msg.request_type == ZMQRequestType.GET_DATA_RESPONSE:
                 # Return data and index information from this storage unit
+                # We need to return messages to get_data() since the zero-copy deserialization directly points to the
+                # memory of messages object.
                 storage_unit_data = response_msg.body["data"]
-                return global_indexes, fields, storage_unit_data
+                return global_indexes, fields, storage_unit_data, messages
             else:
                 raise RuntimeError(
                     f"Failed to get data from storage unit {target_storage_unit}: "
@@ -359,9 +452,12 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         logger.debug(f"[{self.storage_manager_id}]: receive clear_data request, clearing {metadata.size} samples.")
 
-        # group samples by storage unit
+        # Group samples by storage unit using block allocation
+        storage_unit_keys = list(self.storage_unit_infos.keys())
         storage_meta_groups = build_storage_meta_groups(
-            metadata, self.global_index_storage_unit_mapping, self.global_index_local_index_mapping
+            metadata,
+            storage_unit_keys,
+            self.global_index_local_index_mapping,
         )
 
         # clear data
@@ -413,107 +509,73 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         super().close()
 
 
-def _filter_storage_data(storage_meta_group: StorageMetaGroup, data: TensorDict) -> dict[str, Any]:
-    """Filter batch-aligned data from a TensorDict using batch indexes from a StorageMetaGroup.
-    This helper extracts a subset of items from each field in ``data`` according to the
-    batch indexes stored in ``storage_meta_group``. The same indexes are applied to every
-    field in the input ``TensorDict`` so that the returned samples remain aligned across
-    fields.
-
-    Args:
-        storage_meta_group: A :class:`StorageMetaGroup` instance that provides
-            a sequence of batch indexes via :meth:`get_batch_indexes`. Each index
-            refers to a position along the batch dimension of the tensors stored
-            in ``data``.
-        data: A :class:`tensordict.TensorDict` containing batched data fields. All
-            fields are expected to be indexable by the batch indexes returned by
-            ``storage_meta_group.get_batch_indexes()``.
-    Returns:
-        dict[str, Any]: A dictionary mapping each field name in ``data`` to a list
-            of items selected at the requested batch indexes. The order of items in
-            each list matches the order of ``storage_meta_group.get_batch_indexes()``.
-    """
-
-    # We use dict here instead of TensorDict to avoid unnecessary TensorDict overhead
-    results = {}
-    batch_indexes = storage_meta_group.get_batch_indexes()
-
-    if not batch_indexes:
-        return results
-
-    for fname in data.keys():
-        result = itemgetter(*batch_indexes)(data[fname])
-        if not isinstance(result, tuple):
-            result = (result,)
-        results[fname] = list(result)
-
-    return results
-
-
 def build_storage_meta_groups(
     batch_meta: BatchMeta,
-    global_index_storage_unit_mapping: Callable,
+    storage_unit_keys: list[str],
     global_index_local_index_mapping: Callable,
+    start_unit_offset: int = 0,
 ) -> dict[str, StorageMetaGroup]:
-    """Build storage meta groups from batch metadata for distributed storage.
+    """Build storage meta groups using block allocation strategy.
 
-    This function is the starting point of the data distribution workflow. It analyzes
-    BatchMeta containing SampleMeta objects (originating from client requests) and
-    groups them by target storage unit based on their global_index.
+    Optimized O(num_units) version using batch slicing instead of per-sample iteration.
 
-    Key Data Flow:
-    1. BatchMeta contains SampleMeta objects with batch_index (original TensorDict position)
-    2. Each SampleMeta is assigned to a storage unit using global_index mapping
-    3. Local storage positions are calculated for each sample
-    4. Results in StorageMetaGroup objects ready for transfer operations
+    Block Allocation Example (batch_size=7, num_units=3):
+        chunk_size = ceil(7/3) = 3
+        Batch indexes: [0,1,2] -> SU0, [3,4,5] -> SU1, [6] -> SU2
 
     Args:
-        batch_meta: BatchMeta containing SampleMeta objects from client request.
-            Each SampleMeta has:
-            - batch_index: Position in original TensorDict (0-based)
-            - global_index: Global unique identifier across all storage
-        global_index_storage_unit_mapping: Function to map global_index to storage_unit_id.
-            Example: lambda x: storage_unit_ids[x % num_storage_units] (round-robin distribution)
-        global_index_local_index_mapping: Function to map global_index to local_index.
-            Example: lambda x: x // num_storage_units (local position within storage unit)
+        batch_meta: Columnar BatchMeta with global_indexes, partition_ids, field_names
+        storage_unit_keys: List of storage unit IDs
+        global_index_local_index_mapping: Function to map global_index to local_index
+        start_unit_offset: Starting SU offset for cross-batch rotation (default 0)
 
     Returns:
-        Dictionary mapping storage_unit_id to StorageMetaGroup, where each group contains:
-        - storage_id: Target storage unit identifier
-        - sample_metas: List of SampleMeta objects assigned to this unit
-        - local_indexes: List of storage positions for each sample
-
-    Example:
-        >>> # Input: BatchMeta with samples at global_indexes [10, 11, 12]
-        >>> # 3 storage units available: storage_0, storage_1, storage_2
-        >>> batch_meta = BatchMeta(samples=[
-        ...     SampleMeta(batch_index=0, global_index=10),  # Original position 0
-        ...     SampleMeta(batch_index=1, global_index=11),  # Original position 1
-        ...     SampleMeta(batch_index=2, global_index=12)   # Original position 2
-        ... ])
-        >>> groups = build_storage_meta_groups(
-        ...     batch_meta,
-        ...     lambda x: f"storage_{x % 3}",  # 10->storage_1, 11->storage_2, 12->storage_0
-        ...     lambda x: x // 3               # 10->3, 11->3, 12->4
-        ... )
-        >>> groups["storage_1"].sample_metas[0].batch_index  # 0 - original TensorDict position
-        >>> groups["storage_1"].sample_metas[0].local_index  # 3 - storage position
-
-    Note:
-        This function preserves the crucial batch_index information that links each
-        SampleMeta back to its original position in the client's TensorDict.
-        This batch_index is later used by _add_field_data() to extract
-        the correct data items for storage.
+        Dictionary mapping storage_unit_id to StorageMetaGroup
     """
     storage_meta_groups: dict[str, StorageMetaGroup] = {}
 
-    for sample in batch_meta.samples:
-        storage_id = global_index_storage_unit_mapping(sample.global_index)
-        local_index = global_index_local_index_mapping(sample.global_index)
-        if storage_id not in storage_meta_groups:
-            storage_meta_groups[storage_id] = StorageMetaGroup(storage_id=storage_id)
+    num_units = len(storage_unit_keys)
+    batch_size = batch_meta.size
+    field_names = batch_meta.field_names
 
-        # Use add_sample_meta to store SampleMeta references directly
-        storage_meta_groups[storage_id].add_sample_meta(sample, local_index)
+    if batch_size == 0:
+        return storage_meta_groups
+
+    # Block allocation: chunk_size = ceil(batch_size / num_units)
+    chunk_size = (batch_size + num_units - 1) // num_units
+
+    # O(num_units) iteration instead of O(batch_size)
+    for unit_idx in range(num_units):
+        start = unit_idx * chunk_size
+        end = min((unit_idx + 1) * chunk_size, batch_size)
+
+        if start >= batch_size:
+            break
+
+        # Apply rotation offset for cross-batch load balancing
+        storage_id = storage_unit_keys[(start_unit_offset + unit_idx) % num_units]
+
+        # Batch slicing to get all data for this unit
+        batch_indexes = list(range(start, end))
+        global_indexes = batch_meta.global_indexes[start:end]
+        partition_ids = batch_meta.partition_ids[start:end]
+
+        # Convert to lists if they are slices of numpy arrays or similar
+        if not isinstance(global_indexes, list):
+            global_indexes = list(global_indexes)
+        if not isinstance(partition_ids, list):
+            partition_ids = list(partition_ids)
+
+        local_indexes = [global_index_local_index_mapping(gi) for gi in global_indexes]
+
+        # Create StorageMetaGroup with all data at once
+        storage_meta_groups[storage_id] = StorageMetaGroup(
+            storage_id=storage_id,
+            global_indexes=global_indexes,
+            local_indexes=local_indexes,
+            partition_ids=partition_ids,
+            batch_indexes=batch_indexes,
+            field_names=field_names,
+        )
 
     return storage_meta_groups

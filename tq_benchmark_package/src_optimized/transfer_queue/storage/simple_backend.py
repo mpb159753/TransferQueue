@@ -26,9 +26,9 @@ import ray
 import zmq
 from ray.util import get_node_ip_address
 
-from transfer_queue.metadata import SampleMeta
+from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
+from transfer_queue.utils.enum_utils import TransferQueueRole
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
-from transfer_queue.utils.utils import TransferQueueRole, limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket, get_free_port
 
 logger = logging.getLogger(__name__)
@@ -257,9 +257,7 @@ class SimpleStorageUnit:
                         },
                     )
 
-                self.put_get_socket.send_multipart(
-                    [identity, *response_msg.serialize()], copy=False
-                )
+                self.put_get_socket.send_multipart([identity, *response_msg.serialize()], copy=False)
 
     def _handle_put(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
@@ -377,48 +375,55 @@ class SimpleStorageUnit:
 
 @dataclass
 class StorageMetaGroup:
-    """
-    Represents a group of samples stored in the same storage unit.
-    Used to organize samples by their storage_id for efficient client operations.
-    """
+    """Group of metadata for a specific storage unit."""
 
     storage_id: str
-    sample_metas: list[SampleMeta] = dataclasses.field(default_factory=list)
+    global_indexes: list[int] = dataclasses.field(default_factory=list)
     local_indexes: list[int] = dataclasses.field(default_factory=list)
+    partition_ids: list[str] = dataclasses.field(default_factory=list)
+    batch_indexes: list[int] = dataclasses.field(default_factory=list)  # Original TensorDict positions
+    field_names: list[str] = dataclasses.field(default_factory=list)  # Field names from BatchMeta
 
-    def add_sample_meta(self, sample_meta: SampleMeta, local_index: int) -> None:
-        """Add a SampleMeta object to this storage group"""
-        self.sample_metas.append(sample_meta)
+    def add_meta(self, global_index: int, local_index: int, partition_id: str, batch_index: int | None = None):
+        """Add metadata to the group.
+
+        Args:
+            global_index: Global unique index across all storage
+            local_index: Local position within this storage unit
+            partition_id: Partition identifier
+            batch_index: Original position in input TensorDict (optional for backward compat)
+        """
+        self.global_indexes.append(global_index)
         self.local_indexes.append(local_index)
-
-    def get_batch_indexes(self) -> list[int]:
-        """Get all internal indexes from stored SampleMeta objects"""
-        return [meta.batch_index for meta in self.sample_metas]
+        self.partition_ids.append(partition_id)
+        if batch_index is not None:
+            self.batch_indexes.append(batch_index)
 
     def get_global_indexes(self) -> list[int]:
-        """Get all global indexes from stored SampleMeta objects"""
-        return [meta.global_index for meta in self.sample_metas]
+        """Get all global indexes from stored samples"""
+        return self.global_indexes
 
     def get_local_indexes(self) -> list[int]:
-        """Get all local indexes from stored SampleMeta objects"""
+        """Get all local indexes from stored samples"""
         return self.local_indexes
 
+    def get_batch_indexes(self) -> list[int]:
+        """Get original TensorDict position indexes for _filter_storage_data."""
+        return self.batch_indexes
+
     def get_field_names(self) -> list[str]:
-        """Get all unique field names from stored SampleMeta objects"""
-        all_fields: set[str] = set()
-        for meta in self.sample_metas:
-            all_fields.update(meta.fields.keys())
-        return list(all_fields)
+        """Get all field names for this storage group."""
+        return self.field_names
 
     @property
     def size(self) -> int:
         """Number of samples in this storage meta group"""
-        return len(self.sample_metas)
+        return len(self.global_indexes)
 
     @property
     def is_empty(self) -> bool:
         """Check if this storage meta group is empty"""
-        return len(self.sample_metas) == 0
+        return len(self.global_indexes) == 0
 
     def __len__(self) -> int:
         """Number of samples in this storage meta group"""

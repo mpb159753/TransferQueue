@@ -1,0 +1,42 @@
+[
+    {
+        "scenario": "TransferQueue",
+        "setting": "debug (Local)",
+        "data_volume": "0.05 MB",
+        "operation": "PUT",
+        "payload_gb": 4.57763671875e-05,
+        "stats_gbps": {
+            "mean": 0.023474506974146946,
+            "max": 0.038608485823446614,
+            "min": 0.00834052812484728,
+            "p99": 0.03830580624646062
+        },
+        "branch": "optimized-v0.15",
+        "docker_stats": {
+            "max_cpu_percent": 470.16,
+            "avg_cpu_percent": 170.29285714285714,
+            "max_mem_mb": 3878.912,
+            "cpu_seconds": 17.35247559428215
+        }
+    },
+    {
+        "scenario": "TransferQueue",
+        "setting": "debug (Local)",
+        "data_volume": "0.05 MB",
+        "operation": "GET",
+        "payload_gb": 4.57763671875e-05,
+        "stats_gbps": {
+            "mean": 0.03469011600212869,
+            "max": 0.05367438934898836,
+            "min": 0.015705842655269024,
+            "p99": 0.05329470388205117
+        },
+        "branch": "optimized-v0.15",
+        "docker_stats": {
+            "max_cpu_percent": 470.16,
+            "avg_cpu_percent": 170.29285714285714,
+            "max_mem_mb": 3878.912,
+            "cpu_seconds": 17.35247559428215
+        }
+    }
+]

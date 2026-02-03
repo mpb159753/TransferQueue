@@ -16,13 +16,18 @@
 import logging
 import os
 import pickle
-from typing import Any
+import struct
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Optional, TypeAlias
 
 import torch
 from torch import Tensor
 
 from transfer_queue.storage.clients.base import TransferQueueStorageKVClient
 from transfer_queue.storage.clients.factory import StorageClientFactory
+from transfer_queue.utils.serial_utils import _decoder, _encoder
+
+bytestr: TypeAlias = bytes | bytearray | memoryview
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
@@ -31,10 +36,83 @@ NPU_DS_CLIENT_KEYS_LIMIT: int = 9999
 CPU_DS_CLIENT_KEYS_LIMIT: int = 1999
 YUANRONG_DATASYSTEM_IMPORTED: bool = True
 TORCH_NPU_IMPORTED: bool = True
+DS_MAX_WORKERS: int = 16
 try:
-    import datasystem
+    from yr import datasystem
 except ImportError:
     YUANRONG_DATASYSTEM_IMPORTED = False
+
+# Header: number of entries (uint32, little-endian)
+HEADER_FMT = "<I"
+HEADER_SIZE = struct.calcsize(HEADER_FMT)
+# Entry: (payload_offset: uint32, payload_size: uint32)
+ENTRY_FMT = "<II"
+ENTRY_SIZE = struct.calcsize(ENTRY_FMT)
+
+
+def calc_packed_size(items: list[memoryview]) -> int:
+    """
+    Calculate the total size (in bytes) required to pack a list of memoryview items
+    into the structured binary format used by pack_into.
+
+    Args:
+        items: List of memoryview objects to be packed.
+
+    Returns:
+        Total buffer size in bytes.
+    """
+    return HEADER_SIZE + len(items) * ENTRY_SIZE + sum(item.nbytes for item in items)
+
+
+def pack_into(target: memoryview, items: list[memoryview]):
+    """
+    Pack multiple contiguous buffers into a single buffer.
+        ┌───────────────┐
+        │ item_count    │  uint32
+        ├───────────────┤
+        │ entries       │  N * item entries
+        ├───────────────┤
+        │ payload blob  │  N * concatenated buffers
+        └───────────────┘
+
+    Args:
+        target (memoryview): A writable memoryview returned by StateValueBuffer.MutableData().
+            It must be large enough to accommodate the total number of bytes of HEADER + ENTRY_TABLE + all items.
+            This buffer is usually mapped to shared memory or Zero-Copy memory area.
+        items (List[memoryview]): List of read-only memory views (e.g., from serialized objects). Each item must support
+            the buffer protocol and be readable as raw bytes.
+
+    """
+    struct.pack_into(HEADER_FMT, target, 0, len(items))
+
+    entry_offset = HEADER_SIZE
+    payload_offset = HEADER_SIZE + len(items) * ENTRY_SIZE
+
+    target_tensor = torch.frombuffer(target, dtype=torch.uint8)
+
+    for item in items:
+        struct.pack_into(ENTRY_FMT, target, entry_offset, payload_offset, item.nbytes)
+        src_tensor = torch.frombuffer(item, dtype=torch.uint8)
+        target_tensor[payload_offset : payload_offset + item.nbytes].copy_(src_tensor)
+        entry_offset += ENTRY_SIZE
+        payload_offset += item.nbytes
+
+
+def unpack_from(source: memoryview) -> list[bytestr]:
+    """
+    Unpack multiple contiguous buffers from a single packed buffer.
+    Args:
+        source (memoryview): The packed source buffer.
+    Returns:
+        list[bytestr]: List of unpacked contiguous buffers.
+    """
+    mv = memoryview(source)
+    item_count = struct.unpack_from(HEADER_FMT, mv, 0)[0]
+    offsets = []
+    for i in range(item_count):
+        offset, length = struct.unpack_from(ENTRY_FMT, mv, HEADER_SIZE + i * ENTRY_SIZE)
+        offsets.append((offset, length))
+    return [mv[offset : offset + length] for offset, length in offsets]
 
 
 @StorageClientFactory.register("YuanrongStorageClient")
@@ -83,9 +161,11 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         self._cpu_ds_client.init()
 
     def npu_ds_client_is_available(self):
+        """Check if NPU client is available."""
         return self._npu_ds_client is not None
 
     def cpu_ds_client_is_available(self):
+        """Check if CPU client is available."""
         return self._cpu_ds_client is not None
 
     def _create_empty_npu_tensorlist(self, shapes, dtypes):
@@ -103,6 +183,35 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             tensor = torch.empty(shape, dtype=dtype, device=f"npu:{self.device_id}")
             tensors.append(tensor)
         return tensors
+
+    def mset_zcopy(self, keys: list[str], objs: list[Any]):
+        """Store multiple objects in zero-copy mode using parallel serialization and buffer packing.
+
+        Args:
+            keys (list[str]): List of string keys under which the objects will be stored.
+            objs (list[Any]): List of Python objects to store (e.g., tensors, strings).
+        """
+        assert self._cpu_ds_client is not None, "CPU DS client is not available"
+        items_list = [[memoryview(b) for b in _encoder.encode(obj)] for obj in objs]
+        packed_sizes = [calc_packed_size(items) for items in items_list]
+        buffers = self._cpu_ds_client.mcreate(keys, packed_sizes)
+        tasks = [(target.MutableData(), item) for target, item in zip(buffers, items_list, strict=False)]
+        with ThreadPoolExecutor(max_workers=DS_MAX_WORKERS) as executor:
+            list(executor.map(lambda p: pack_into(*p), tasks))
+        self._cpu_ds_client.mset_buffer(buffers)
+
+    def mget_zcopy(self, keys: list[str]) -> list[Any]:
+        """Retrieve multiple objects in zero-copy mode by directly deserializing from shared memory buffers.
+
+        Args:
+            keys (list[str]): List of string keys to retrieve from storage.
+
+        Returns:
+            list[Any]: List of deserialized objects corresponding to the input keys.
+        """
+        assert self._cpu_ds_client is not None, "CPU DS client is not available"
+        buffers = self._cpu_ds_client.get_buffers(keys)
+        return [_decoder.decode(unpack_from(buffer)) if buffer is not None else None for buffer in buffers]
 
     def _batch_put(self, keys: list[str], values: list[Any]):
         """Stores a batch of key-value pairs to remote storage, splitting by device type.
@@ -134,6 +243,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                     cpu_values.append(pickle.dumps(value))
 
             # put NPU data
+            assert self._npu_ds_client is not None, "NPU DS client is not available"
             for i in range(0, len(npu_keys), NPU_DS_CLIENT_KEYS_LIMIT):
                 batch_keys = npu_keys[i : i + NPU_DS_CLIENT_KEYS_LIMIT]
                 batch_values = npu_values[i : i + NPU_DS_CLIENT_KEYS_LIMIT]
@@ -146,6 +256,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                 self._npu_ds_client.dev_mset(batch_keys, batch_values)
 
             # put CPU data
+            assert self._cpu_ds_client is not None, "CPU DS client is not available"
             for i in range(0, len(cpu_keys), CPU_DS_CLIENT_KEYS_LIMIT):
                 batch_keys = cpu_keys[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
                 batch_values = cpu_values[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
@@ -153,13 +264,12 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
 
         else:
             #  All data goes through CPU path
-            pickled_values = [pickle.dumps(v) for v in values]
             for i in range(0, len(keys), CPU_DS_CLIENT_KEYS_LIMIT):
                 batch_keys = keys[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
-                batch_vals = pickled_values[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
-                self._cpu_ds_client.mset(batch_keys, batch_vals)
+                batch_vals = values[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
+                self.mset_zcopy(batch_keys, batch_vals)
 
-    def put(self, keys: list[str], values: list[Any]):
+    def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
         """Stores multiple key-value pairs to remote storage.
 
         Automatically routes NPU tensors to high-performance tensor storage,
@@ -174,6 +284,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         if len(keys) != len(values):
             raise ValueError("Number of keys must match number of values")
         self._batch_put(keys, values)
+        return None
 
     def _batch_get(self, keys: list[str], shapes: list, dtypes: list) -> list[Any]:
         """Retrieves a batch of values from remote storage using expected metadata.
@@ -213,6 +324,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             results = [None] * len(keys)
 
             # Fetch NPU tensors
+            assert self._npu_ds_client is not None, "NPU DS client is not available"
             for i in range(0, len(npu_keys), NPU_DS_CLIENT_KEYS_LIMIT):
                 batch_keys = npu_keys[i : i + NPU_DS_CLIENT_KEYS_LIMIT]
                 batch_shapes = npu_shapes[i : i + NPU_DS_CLIENT_KEYS_LIMIT]
@@ -240,6 +352,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                     cpu_indices.extend([batch_indices[j] for j, k in enumerate(batch_keys) if k in failed_set])
 
             # Fetch CPU/general objects (including NPU fallbacks)
+            assert self._cpu_ds_client is not None, "CPU DS client is not available"
             for i in range(0, len(cpu_keys), CPU_DS_CLIENT_KEYS_LIMIT):
                 batch_keys = cpu_keys[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
                 batch_indices = cpu_indices[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
@@ -249,7 +362,19 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
 
             return results
 
-    def get(self, keys: list[str], shapes=None, dtypes=None) -> list[Any]:
+        else:
+            results = [None] * len(keys)
+            cpu_indices = list(range(len(keys)))
+
+            for i in range(0, len(keys), CPU_DS_CLIENT_KEYS_LIMIT):
+                batch_keys = keys[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
+                batch_indices = cpu_indices[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
+                objects = self.mget_zcopy(batch_keys)
+                for idx, obj in zip(batch_indices, objects, strict=False):
+                    results[idx] = obj
+            return results
+
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
         """Retrieves multiple values from remote storage with expected metadata.
 
         Requires shape and dtype hints to reconstruct NPU tensors correctly.
@@ -258,6 +383,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             keys (List[str]): Keys to fetch.
             shapes (List[List[int]]): Expected tensor shapes (use [] for scalars).
             dtypes (List[Optional[torch.dtype]]): Expected dtypes; use None for non-tensor data.
+            custom_meta (List[str], optional): Device type (npu/cpu) for each key
 
         Returns:
             List[Any]: Retrieved values in the same order as input keys.
@@ -278,6 +404,8 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             keys (List[str]): Keys to delete.
         """
         if self.npu_ds_client_is_available():
+            assert self._npu_ds_client is not None, "NPU DS client is not available"
+            assert self._cpu_ds_client is not None, "CPU DS client is not available"
             # Try to delete all keys via npu client
             for i in range(0, len(keys), NPU_DS_CLIENT_KEYS_LIMIT):
                 batch = keys[i : i + NPU_DS_CLIENT_KEYS_LIMIT]
@@ -288,6 +416,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                 sub_batch = keys[j : j + CPU_DS_CLIENT_KEYS_LIMIT]
                 self._cpu_ds_client.delete(sub_batch)
         else:
+            assert self._cpu_ds_client is not None, "CPU DS client is not available"
             for i in range(0, len(keys), CPU_DS_CLIENT_KEYS_LIMIT):
                 batch = keys[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
                 self._cpu_ds_client.delete(batch)

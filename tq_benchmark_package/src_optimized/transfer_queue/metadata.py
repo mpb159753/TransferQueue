@@ -27,8 +27,6 @@ import torch
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData, NonTensorStack
 
-from transfer_queue.utils.utils import ProductionStatus
-
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
 
@@ -39,205 +37,86 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
 
 
-# TODO: Add UT for metadata operations
-@dataclass
-class FieldMeta:
-    """Records the metadata of a single data field (name, dtype, shape, etc.)."""
-
-    name: str
-    dtype: Optional[Any]  # Data type (e.g., torch.float32, numpy.float32)
-    shape: Optional[Any]  # Data shape (e.g., torch.Size([3, 224, 224]), (3, 224, 224))
-    production_status: ProductionStatus = ProductionStatus.NOT_PRODUCED
-
-    def __str__(self) -> str:
-        return (
-            f"FieldMeta(name='{self.name}', dtype={self.dtype}, "
-            f"shape={self.shape}, production_status={self.production_status})"
-        )
-
-    @property
-    def is_ready(self) -> bool:
-        """Check if this field is ready for consumption"""
-        return self.production_status == ProductionStatus.READY_FOR_CONSUME
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "FieldMeta":
-        """Create FieldMeta from dictionary."""
-        return cls(
-            name=data["name"],
-            dtype=data["dtype"],
-            shape=data["shape"],
-            production_status=ProductionStatus(str(data["production_status"]))
-            if isinstance(data["production_status"], (int, str))
-            else data["production_status"],
-        )
-
-
-@dataclass
-class SampleMeta:
-    """Records the metadata of a single data sample (stored as a row in the data system)."""
-
-    partition_id: str  # Partition id, used for data versioning
-    global_index: int  # Global row index, uniquely identifies a data sample
-    fields: dict[str, FieldMeta]  # Fields of interest for this sample
-
-    def __post_init__(self):
-        """Initialize is_ready property based on field readiness"""
-        # Check if all fields are ready and update is_ready property
-        object.__setattr__(self, "_is_ready", all(field.is_ready for field in self.fields.values()))
-
-    def __str__(self) -> str:
-        return f"SampleMeta(partition_id={self.partition_id}, global_index={self.global_index})"
-
-    @property
-    def field_names(self) -> list[str]:
-        """Get list of field names for this sample"""
-        return list(self.fields.keys())
-
-    @property
-    def batch_index(self) -> int:
-        """Get the batch index of this sample (to be set by BatchMeta)"""
-        return getattr(self, "_batch_index", -1)
-
-    def get_field_by_name(self, name: str) -> Optional[FieldMeta]:
-        """Get FieldMeta by field name"""
-        return self.fields.get(name)
-
-    def has_field(self, name: str) -> bool:
-        """Check if this sample has a specific field"""
-        return name in self.fields
-
-    def is_field_ready(self, field_name: str) -> bool:
-        """Check if a specific field is ready for consumption"""
-        field = self.fields.get(field_name)
-        return field.is_ready if field else False
-
-    def add_fields(self, fields: dict[str, FieldMeta]) -> "SampleMeta":
-        """
-        Add new fields to this sample. New fields will be initialized with given dtype, shape
-        and production_status (if provided). If not provided, default values (None, None, READY_FOR_CONSUME)
-        will be used. This modifies the sample in-place to include the new fields.
-        """
-        self.fields = _union_fields(self.fields, fields)
-        # Update is_ready property
-        object.__setattr__(self, "_is_ready", all(field.is_ready for field in self.fields.values()))
-        return self
-
-    def select_fields(self, field_names: list[str]) -> "SampleMeta":
-        """
-        Select specific fields from this sample.
-        This will construct a new SampleMeta instance containing only the specified fields.
-
-        Args:
-            field_names (list[str]): List of field names to retain.
-
-        Returns:
-            SampleMeta: A new SampleMeta instance containing only the specified fields.
-        """
-        selected_fields = {name: self.fields[name] for name in field_names if name in self.fields}
-
-        # construct new SampleMeta instance
-        selected_sample_meta = SampleMeta(
-            fields=selected_fields, partition_id=self.partition_id, global_index=self.global_index
-        )
-
-        return selected_sample_meta
-
-    def union(self, other: "SampleMeta", validate: bool = True) -> "SampleMeta":
-        """
-        Create a union of this sample's fields with another sample's fields.
-        Assume both samples have the same global index. If fields overlap, the
-        fields in this sample will be replaced by the other sample's fields.
-
-        Args:
-            other: Another SampleMeta to union with
-            validate: Whether to validate union conditions
-
-        Returns:
-            New SampleMeta with unioned fields (None if validation fails)
-        """
-        if validate:
-            if self.global_index != other.global_index:
-                raise ValueError(
-                    f"Error: Global indexes ({self.global_index} and {other.global_index}) do not match for union."
-                )
-
-        # Merge fields
-        self.fields = _union_fields(self.fields, other.fields)
-
-        # Update is_ready property
-        object.__setattr__(self, "_is_ready", all(field.is_ready for field in self.fields.values()))
-        return self
-
-    @property
-    def is_ready(self) -> bool:
-        """Check if all fields in this sample are ready for consumption"""
-        return getattr(self, "_is_ready", False)
-
-    @property
-    def production_status(self) -> dict[str, ProductionStatus]:
-        """Get production status for all fields (backward compatibility)"""
-        return {name: field.production_status for name, field in self.fields.items()}
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "SampleMeta":
-        """Create SampleMeta from dictionary."""
-        fields = {
-            name: FieldMeta.from_dict(field_data) if isinstance(field_data, dict) else field_data
-            for name, field_data in data["fields"].items()
-        }
-        return cls(
-            partition_id=data["partition_id"],
-            global_index=data["global_index"],
-            fields=fields,
-        )
-
-
 @dataclass
 class BatchMeta:
-    """Records the metadata of a batch of data samples."""
+    """Records the metadata of a batch of data samples with optimized field-level schema.
 
-    samples: list[SampleMeta]
+    This is the O(BxF) optimized version that stores field metadata at the field level
+    instead of per-sample, reducing storage from O(B*F) to O(F).
+
+    Attributes:
+        global_indexes: List of global sample indices in this batch.
+        partition_ids: List of partition IDs corresponding to each sample.
+        field_schema: Field-level metadata {field_name: {dtype, shape, is_nested, is_non_tensor, per_sample_shapes}}.
+        production_status: Vectorized production status, shape (B,) where B is batch size.
+        extra_info: Additional batch-level information.
+        _custom_meta: Per-sample custom metadata for storage backends.
+    """
+
+    global_indexes: list[int]
+    partition_ids: list[str]
+    # O(F) field-level metadata: {field_name: {dtype, shape, is_nested, is_non_tensor, per_sample_shapes}}
+    field_schema: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
+    # O(B) vectorized production status
+    production_status: Optional[np.ndarray] = None
     extra_info: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # internal data for different storage backends: _custom_meta[global_index][field]
+    _custom_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
         """Initialize all computed properties during initialization"""
-        self.samples = copy.deepcopy(self.samples)
+        self.global_indexes = copy.deepcopy(self.global_indexes)
+        self.partition_ids = copy.deepcopy(self.partition_ids)
+        self.field_schema = copy.deepcopy(self.field_schema)
         self.extra_info = copy.deepcopy(self.extra_info)
 
-        # Basic properties
-        object.__setattr__(self, "_size", len(self.samples))
-        object.__setattr__(self, "_is_ready", all(sample.is_ready for sample in self.samples))
+        # Validation
+        if len(self.global_indexes) != len(self.partition_ids):
+            raise ValueError(
+                f"Length mismatch: global_indexes has {len(self.global_indexes)}, "
+                f"partition_ids has {len(self.partition_ids)}"
+            )
 
-        # Pre-compute all list properties for better performance
-        if self.samples:
-            for idx, sample in enumerate(self.samples):
-                object.__setattr__(sample, "_batch_index", idx)  # Ensure batch_index is set correctly
+        batch_size = len(self.global_indexes)
 
-            object.__setattr__(self, "_global_indexes", [sample.global_index for sample in self.samples])
+        # Validate production_status if provided
+        if self.production_status is not None:
+            if isinstance(self.production_status, np.ndarray):
+                self.production_status = self.production_status.copy()
+            elif isinstance(self.production_status, torch.Tensor):
+                self.production_status = self.production_status.numpy().copy()
+            elif isinstance(self.production_status, list):
+                self.production_status = np.array(self.production_status, dtype=np.int8)
 
-            # check if all samples have the same field names
-            first_sample_field_names = sorted(self.samples[0].field_names)
-            if not all(sorted(sample.field_names) == first_sample_field_names for sample in self.samples):
-                raise ValueError("All samples in BatchMeta must have the same field_names.")
-            object.__setattr__(self, "_field_names", first_sample_field_names)
-
-            object.__setattr__(self, "_partition_ids", [sample.partition_id for sample in self.samples])
-
+            if len(self.production_status) != batch_size:
+                raise ValueError(f"production_status length {len(self.production_status)} != batch_size {batch_size}")
         else:
-            object.__setattr__(self, "_global_indexes", [])
-            object.__setattr__(self, "_field_names", [])
-            object.__setattr__(self, "_partition_ids", [])
+            # Default: all NOT_PRODUCED
+            self.production_status = np.zeros(batch_size, dtype=np.int8) if batch_size > 0 else None
+
+        # Validate per_sample_shapes in field_schema
+        for field_name, meta in self.field_schema.items():
+            if meta.get("per_sample_shapes") is not None:
+                if len(meta["per_sample_shapes"]) != batch_size:
+                    raise ValueError(
+                        f"Field '{field_name}' per_sample_shapes length {len(meta['per_sample_shapes'])} "
+                        f"!= batch_size {batch_size}"
+                    )
+
+        self._size = batch_size
+        self._field_names = sorted(self.field_schema.keys())
+
+        # Check if is_ready (all production_status == READY_FOR_CONSUME i.e. 1)
+        is_ready = False
+        if batch_size > 0 and self.production_status is not None:
+            is_ready = bool(np.all(self.production_status == 1))
+
+        self._is_ready = is_ready
 
     @property
     def size(self) -> int:
         """Return the number of samples in this batch"""
         return getattr(self, "_size", 0)
-
-    @property
-    def global_indexes(self) -> list[int]:
-        """Get all global indexes in this batch"""
-        return getattr(self, "_global_indexes", [])
 
     @property
     def field_names(self) -> list[str]:
@@ -247,13 +126,20 @@ class BatchMeta:
     @property
     def is_ready(self) -> bool:
         """Check if all samples in this batch are ready for consumption"""
-        # TODO: get ready status from controller realtime
         return getattr(self, "_is_ready", False)
 
-    @property
-    def partition_ids(self) -> list[str]:
-        """Get partition ids for all samples in this batch as a list (one per sample)"""
-        return getattr(self, "_partition_ids", [])
+    # Custom meta methods for different storage backends
+    def get_all_custom_meta(self) -> dict[int, dict[str, Any]]:
+        """Get the entire custom meta dictionary"""
+        return copy.deepcopy(self._custom_meta)
+
+    def update_custom_meta(self, new_custom_meta: Optional[dict[int, dict[str, Any]]]):
+        """Update custom meta with a new dictionary"""
+        if new_custom_meta:
+            for idx, meta in new_custom_meta.items():
+                if idx not in self._custom_meta:
+                    self._custom_meta[idx] = {}
+                self._custom_meta[idx].update(meta)
 
     # Extra info interface methods
     def get_extra_info(self, key: str, default: Any = None) -> Any:
@@ -287,24 +173,56 @@ class BatchMeta:
     def add_fields(self, tensor_dict: TensorDict, set_all_ready: bool = True) -> "BatchMeta":
         """
         Add new fields from a TensorDict to all samples in this batch.
-        This modifies each sample in-place to include the new fields.
+        This modifies the batch in-place to include the new fields.
 
         Args:
             tensor_dict (TensorDict): The input TensorDict containing new fields.
             set_all_ready (bool): If True, set all production_status to READY_FOR_CONSUME. Default is True.
         """
-        fields = _extract_field_metas(tensor_dict, set_all_ready)
+        batch_size = tensor_dict.batch_size[0]
+        if batch_size != self.size:
+            raise ValueError(f"add_fields batch size mismatch: self.size={self.size} vs tensor_dict={batch_size}")
 
-        if fields:
-            if len(self.samples) != len(fields):
-                raise ValueError(f"add_fields length mismatch: samples={len(self.samples)} vs fields={len(fields)}")
-        for idx, sample in enumerate(self.samples):
-            sample.add_fields(fields=fields[idx])
+        for name, value in tensor_dict.items():
+            # Determine if this is a nested tensor
+            is_nested = isinstance(value, torch.Tensor) and value.is_nested
 
-        # Update batch-level fields cache
-        if self.samples:
-            object.__setattr__(self, "_field_names", sorted(self.samples[0].field_names))
-            object.__setattr__(self, "_is_ready", all(sample.is_ready for sample in self.samples))
+            first_item = None
+            if is_nested:
+                unbound = value.unbind()
+                first_item = unbound[0] if unbound else None
+            else:
+                first_item = value[0] if len(value) > 0 else None
+
+            # Determine if this is non-tensor data
+            is_non_tensor = not isinstance(first_item, torch.Tensor) if first_item is not None else False
+
+            field_meta = {
+                "dtype": getattr(first_item, "dtype", type(first_item) if first_item is not None else None),
+                "shape": getattr(first_item, "shape", None) if not is_nested else None,
+                "is_nested": is_nested,
+                "is_non_tensor": is_non_tensor,
+            }
+
+            # For nested tensors, record per-sample shapes
+            if is_nested:
+                field_meta["per_sample_shapes"] = [tuple(t.shape) for t in value.unbind()]
+
+            self.field_schema[name] = field_meta
+
+        # Update production status if set_all_ready
+        if set_all_ready and self.production_status is not None:
+            self.production_status[:] = 1
+
+        # Update cached properties
+        self._field_names = sorted(self.field_schema.keys())
+
+        # Re-evaluate is_ready
+        is_ready = False
+        if self.size > 0 and self.production_status is not None:
+            is_ready = bool(np.all(self.production_status == 1))
+        self._is_ready = is_ready
+
         return self
 
     def select_samples(self, sample_indices: list[int]) -> "BatchMeta":
@@ -318,16 +236,39 @@ class BatchMeta:
         Returns:
             BatchMeta: A new BatchMeta instance containing only the specified samples.
         """
+        if any(i < 0 or i >= self.size for i in sample_indices):
+            raise ValueError(f"Sample indices must be in range [0, {self.size})")
 
-        if any(i < 0 or i >= len(self.samples) for i in sample_indices):
-            raise ValueError(f"Sample indices must be in range [0, {len(self.samples)})")
+        new_global_indexes = [self.global_indexes[i] for i in sample_indices]
+        new_partition_ids = [self.partition_ids[i] for i in sample_indices]
 
-        selected_samples = [self.samples[i] for i in sample_indices]
+        # Select production_status
+        new_production_status = None
+        if self.production_status is not None:
+            new_production_status = self.production_status[sample_indices]
 
-        # construct new BatchMeta instance
-        selected_batch_meta = BatchMeta(samples=selected_samples, extra_info=self.extra_info)
+        # Select per_sample_shapes in field_schema
+        new_field_schema = {}
+        for fname, meta in self.field_schema.items():
+            new_meta = copy.deepcopy(meta)
+            if meta.get("per_sample_shapes") is not None:
+                new_meta["per_sample_shapes"] = [meta["per_sample_shapes"][i] for i in sample_indices]
+            new_field_schema[fname] = new_meta
 
-        return selected_batch_meta
+        # Select custom meta
+        new_custom_meta = {}
+        for idx in new_global_indexes:
+            if idx in self._custom_meta:
+                new_custom_meta[idx] = copy.deepcopy(self._custom_meta[idx])
+
+        return BatchMeta(
+            global_indexes=new_global_indexes,
+            partition_ids=new_partition_ids,
+            field_schema=new_field_schema,
+            production_status=new_production_status,
+            extra_info=self.extra_info,
+            _custom_meta=new_custom_meta,
+        )
 
     def select_fields(self, field_names: list[str]) -> "BatchMeta":
         """
@@ -338,26 +279,39 @@ class BatchMeta:
             field_names (list[str]): List of field names to retain.
 
         Returns:
-            BatchMeta: A new BatchMeta instance containing only the specified fields from all samples.
+            BatchMeta: A new BatchMeta instance containing only the specified fields.
         """
-        # select fields for each SampleMeta
-        new_samples = [sample.select_fields(field_names=field_names) for sample in self.samples]
+        new_field_schema = {}
+        for fname in field_names:
+            if fname in self.field_schema:
+                new_field_schema[fname] = copy.deepcopy(self.field_schema[fname])
 
-        # construct new BatchMeta instance
-        new_batch_meta = BatchMeta(samples=new_samples, extra_info=self.extra_info)
-
-        return new_batch_meta
+        return BatchMeta(
+            global_indexes=self.global_indexes,
+            partition_ids=self.partition_ids,
+            field_schema=new_field_schema,
+            production_status=self.production_status.copy() if self.production_status is not None else None,
+            extra_info=self.extra_info,
+            _custom_meta=self._custom_meta,
+        )
 
     def __len__(self) -> int:
         """Return the number of samples in this batch."""
-        return len(self.samples)
+        return self.size
 
-    def __getitem__(self, item):
+    def __getitem__(self, item) -> "BatchMeta":
         if isinstance(item, int | np.integer):
-            sample_meta = self.samples[item] if self.samples else []
-            return BatchMeta(samples=[sample_meta], extra_info=self.extra_info)
+            if item < 0:
+                item += self.size
+            if item < 0 or item >= self.size:
+                raise IndexError("BatchMeta index out of range")
+            return self.select_samples([item])
+        elif isinstance(item, slice):
+            start, stop, step = item.indices(self.size)
+            indices = list(range(start, stop, step))
+            return self.select_samples(indices)
         else:
-            raise TypeError(f"Indexing with {type(item)} is not supported now!")
+            raise TypeError(f"Indexing with {type(item)} is not supported.")
 
     def chunk(self, chunks: int) -> list["BatchMeta"]:
         """
@@ -370,7 +324,7 @@ class BatchMeta:
             List of smaller BatchMeta chunks
         """
         chunk_list = []
-        n = len(self.samples)
+        n = self.size
 
         if n < chunks:
             logger.warning(
@@ -384,14 +338,44 @@ class BatchMeta:
 
         start = 0
         for i in range(chunks):
-            # Calculate the size of the current chunk(the first remainder chunk is 1 more than the base size)
             current_chunk_size = base_size + 1 if i < remainder else base_size
             end = start + current_chunk_size
-            chunk_samples = self.samples[start:end]
-            chunk = BatchMeta(samples=chunk_samples, extra_info=self.extra_info)
+            indices = list(range(start, end))
+            chunk = self.select_samples(indices)
             chunk_list.append(chunk)
             start = end
         return chunk_list
+
+    def union(self, other: "BatchMeta") -> "BatchMeta":
+        """
+        Return the union of this BatchMeta and another BatchMeta.
+        Samples with global_indexes already present in this batch are ignored from the other batch.
+
+        Args:
+            other: The other BatchMeta to merge with.
+
+        Returns:
+            BatchMeta: A new merged BatchMeta.
+        """
+        if not other or other.size == 0:
+            return self
+        if self.size == 0:
+            return other
+
+        self_indexes = set(self.global_indexes)
+        # Find indices in 'other' that are NOT in 'self'
+        unique_indices_in_other = [i for i, idx in enumerate(other.global_indexes) if idx not in self_indexes]
+
+        if not unique_indices_in_other:
+            return self
+
+        # improved performance: if all are unique, just concat
+        if len(unique_indices_in_other) == other.size:
+            return BatchMeta.concat([self, other])
+
+        # otherwise, select unique samples and concat
+        other_unique = other.select_samples(unique_indices_in_other)
+        return BatchMeta.concat([self, other_unique])
 
     @classmethod
     def concat(cls, data: list["BatchMeta"], validate: bool = True) -> "BatchMeta":
@@ -410,14 +394,14 @@ class BatchMeta:
         """
         if not data:
             logger.warning("Try to concat empty BatchMeta chunks. Returning empty BatchMeta.")
-            return BatchMeta(samples=[], extra_info={})
+            return BatchMeta.empty()
 
         # skip empty chunks
-        data = [chunk for chunk in data if chunk and len(chunk.samples) > 0]
+        data = [chunk for chunk in data if chunk and chunk.size > 0]
 
         if len(data) == 0:
             logger.warning("No valid BatchMeta chunks to concatenate. Returning empty BatchMeta.")
-            return BatchMeta(samples=[], extra_info={})
+            return BatchMeta.empty()
 
         if validate:
             base_fields = data[0].field_names
@@ -426,8 +410,43 @@ class BatchMeta:
                 if chunk.field_names != base_fields:
                     raise ValueError("Error: Field names do not match for concatenation.")
 
-        # Combine all samples
-        all_samples = list(itertools.chain.from_iterable(chunk.samples for chunk in data))
+        # Combine lists
+        all_global_indexes = list(itertools.chain.from_iterable(chunk.global_indexes for chunk in data))
+        all_partition_ids = list(itertools.chain.from_iterable(chunk.partition_ids for chunk in data))
+
+        # Combine production_status
+        all_production_status = None
+        status_arrays = [chunk.production_status for chunk in data if chunk.production_status is not None]
+        if status_arrays:
+            all_production_status = np.concatenate(status_arrays)
+
+        # Combine field_schema (merge per_sample_shapes)
+        all_field_schema: dict[str, dict[str, Any]] = {}
+        first_chunk = data[0]
+        for fname, meta in first_chunk.field_schema.items():
+            all_field_schema[fname] = {
+                "dtype": meta.get("dtype"),
+                "shape": meta.get("shape"),
+                "is_nested": meta.get("is_nested", False),
+                "is_non_tensor": meta.get("is_non_tensor", False),
+            }
+            # Concatenate per_sample_shapes if any chunk has them
+            if any(chunk.field_schema.get(fname, {}).get("per_sample_shapes") for chunk in data):
+                all_shapes = []
+                for chunk in data:
+                    chunk_meta = chunk.field_schema.get(fname, {})
+                    chunk_shapes = chunk_meta.get("per_sample_shapes")
+                    if chunk_shapes:
+                        all_shapes.extend(chunk_shapes)
+                    else:
+                        # Fill with None for chunks without per_sample_shapes
+                        all_shapes.extend([None] * chunk.size)
+                all_field_schema[fname]["per_sample_shapes"] = all_shapes
+
+        # Combine custom meta
+        all_custom_meta = {}
+        for chunk in data:
+            all_custom_meta.update(chunk.get_all_custom_meta())
 
         # Merge all extra_info dictionaries from the chunks
         merged_extra_info = dict()
@@ -456,130 +475,39 @@ class BatchMeta:
             else:
                 merged_extra_info[key] = values[-1]
 
-        return BatchMeta(samples=all_samples, extra_info=merged_extra_info)
-
-    def union(self, other: "BatchMeta", validate: bool = True) -> Optional["BatchMeta"]:
-        """
-        Create a union of this batch's fields with another batch's fields.
-        Assume both batches have the same global indices and matching partition_ids for all samples.
-         If fields overlap, the fields in this batch will be replaced by the other batch's fields.
-
-        Args:
-            other: Another BatchMeta to union with
-            validate: Whether to validate union conditions
-
-        Returns:
-            New BatchMeta with unioned fields
-
-        Raises:
-            ValueError: If validation fails (e.g., batch sizes or global indexes do not match)
-        """
-        if validate:
-            if self.size != other.size:
-                raise ValueError("Error: Batch sizes do not match for union.")
-
-            self_global_indexes = sorted(self.global_indexes)
-            other_global_indexes = sorted(other.global_indexes)
-            if self_global_indexes != other_global_indexes:
-                raise ValueError("Error: Global indexes do not match for union.")
-
-            if self.partition_ids != other.partition_ids:
-                raise ValueError("Error: Partition IDs do not match for union.")
-
-        # Create a mapping from global_index to SampleMeta in the other batch
-        other_sample_map = {sample.global_index: sample for sample in other.samples}
-
-        # Merge samples
-        merged_samples = []
-        for sample in self.samples:
-            if sample.global_index in other_sample_map:
-                other_sample = other_sample_map[sample.global_index]
-                merged_sample = sample.union(other_sample, validate=validate)
-                merged_samples.append(merged_sample)
-            else:
-                merged_samples.append(sample)
-
-        # Merge extra info dictionaries
-        merged_extra_info = {**self.extra_info, **other.extra_info}
-        return BatchMeta(samples=merged_samples, extra_info=merged_extra_info)
+        return BatchMeta(
+            global_indexes=all_global_indexes,
+            partition_ids=all_partition_ids,
+            field_schema=all_field_schema,
+            production_status=all_production_status,
+            extra_info=merged_extra_info,
+            _custom_meta=all_custom_meta,
+        )
 
     def reorder(self, indices: list[int]):
         """
-        Reorder the SampleMeta in the BatchMeta according to the given indices (must equal to the length of samples).
-
-        The operation is performed in-place, modifying the current BatchMeta's SampleMeta order.
-
-        To select a subset of samples or repeat specific samples, please use the non-inplace method select_samples().
-
-        Args:
-            indices : list[int]
-                A list of integers specifying the new order of SampleMeta. Each integer
-                represents the current index of the SampleMeta in the BatchMeta.
+        Reorder the samples in the BatchMeta according to the given indices.
+        The operation is performed in-place.
         """
-
         if len(indices) != self.size:
-            raise ValueError(
-                f"Attempted to reorder with indices length {len(indices)} that does not match samples length "
-                f"{self.size}. Please use non-inplace method select_samples() instead if you want to "
-                f"select a subset of samples or repeat specific samples."
-            )
+            raise ValueError(f"Indices length {len(indices)} mismatch batch size {self.size}")
 
         if len(set(indices)) != self.size:
-            raise ValueError(
-                f"Indices={indices} contain duplicates. Please use non-inplace method "
-                f"select_samples() instead if you want to select a subset of samples or repeat specific samples."
-            )
+            raise ValueError("Indices contain duplicates")
 
-        if any(i < 0 or i >= len(self.samples) for i in indices):
-            raise ValueError(f"Reorder indices must be in the range [0, {self.size}).")
+        if any(i < 0 or i >= self.size for i in indices):
+            raise ValueError(f"Reorder indices must be in range [0, {self.size})")
 
-        # Reorder the samples
-        reordered_samples = [self.samples[i] for i in indices]
-        object.__setattr__(self, "samples", reordered_samples)
+        self.global_indexes = [self.global_indexes[i] for i in indices]
+        self.partition_ids = [self.partition_ids[i] for i in indices]
 
-        # Update necessary attributes
-        self._update_after_reorder()
+        if self.production_status is not None:
+            self.production_status = self.production_status[indices]
 
-    def _update_after_reorder(self) -> None:
-        """Update related attributes specifically for the reorder operation"""
-        # Update batch_index for each sample
-        for idx, sample in enumerate(self.samples):
-            object.__setattr__(sample, "_batch_index", idx)
-
-        # Update cached index lists
-        object.__setattr__(self, "_global_indexes", [sample.global_index for sample in self.samples])
-        object.__setattr__(self, "_partition_ids", [sample.partition_id for sample in self.samples])
-
-        # Note: No need to update _size, _field_names, _is_ready, etc., as these remain unchanged after reorder
-
-    @classmethod
-    def from_samples(
-        cls, samples: SampleMeta | list[SampleMeta], extra_info: Optional[dict[str, Any]] = None
-    ) -> "BatchMeta":
-        """
-        Create a BatchMeta from a single SampleMeta or a list of SampleMeta objects.
-
-        Args:
-            samples: A single SampleMeta or a list of SampleMeta objects
-            extra_info: Optional additional information to store with the batch
-
-        Returns:
-            BatchMeta instance containing the provided sample(s)
-
-        Example:
-            >>> sample_meta = SampleMeta(...)
-            >>> batch_meta = BatchMeta.from_samples(sample_meta)
-
-            >>> sample_metas = [sample1, sample2, sample3]
-            >>> batch_meta = BatchMeta.from_samples(sample_metas, extra_info={"source": "training"})
-        """
-        if extra_info is None:
-            extra_info = {}
-
-        if isinstance(samples, SampleMeta):
-            samples = [samples]
-
-        return cls(samples=samples, extra_info=extra_info)
+        # Reorder per_sample_shapes in field_schema
+        for fname, meta in self.field_schema.items():
+            if meta.get("per_sample_shapes") is not None:
+                meta["per_sample_shapes"] = [meta["per_sample_shapes"][i] for i in indices]
 
     @classmethod
     def empty(cls, extra_info: Optional[dict[str, Any]] = None) -> "BatchMeta":
@@ -597,63 +525,73 @@ class BatchMeta:
         """
         if extra_info is None:
             extra_info = {}
-        return cls(samples=[], extra_info=extra_info)
+        return cls(
+            global_indexes=[],
+            partition_ids=[],
+            field_schema={},
+            production_status=None,
+            extra_info=extra_info,
+        )
 
     def __str__(self):
-        sample_strs = ", ".join(str(sample) for sample in self.samples)
         return (
             f"BatchMeta(size={self.size}, field_names={self.field_names}, is_ready={self.is_ready}, "
-            f"samples=[{sample_strs}], extra_info={self.extra_info})"
+            f"global_indexes={self.global_indexes}, extra_info={self.extra_info})"
         )
+
+    def to_dict(self) -> dict:
+        """Convert BatchMeta to dict for serialization.
+
+        Note: Actual serialization (including dtype encoding) is handled by serial_utils.
+        """
+        serialized_schema = {}
+        for fname, meta in self.field_schema.items():
+            serialized_schema[fname] = {
+                "dtype": meta.get("dtype"),  # Will be handled by serial_utils
+                "shape": list(meta["shape"]) if meta.get("shape") else None,
+                "is_nested": meta.get("is_nested", False),
+                "is_non_tensor": meta.get("is_non_tensor", False),
+            }
+            if meta.get("per_sample_shapes"):
+                serialized_schema[fname]["per_sample_shapes"] = [list(s) for s in meta["per_sample_shapes"]]
+
+        return {
+            "global_indexes": self.global_indexes,
+            "partition_ids": self.partition_ids,
+            "field_schema": serialized_schema,
+            "production_status": self.production_status.tolist() if self.production_status is not None else None,
+            "extra_info": self.extra_info,
+            "custom_meta": self._custom_meta,
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> "BatchMeta":
-        """Create BatchMeta from dictionary."""
-        samples = [
-            SampleMeta.from_dict(sample_data) if isinstance(sample_data, dict) else sample_data
-            for sample_data in data["samples"]
-        ]
+        """Create BatchMeta from dictionary.
+
+        Note: Actual deserialization (including dtype decoding) is handled by serial_utils.
+        """
+        # Reconstruct field_schema
+        field_schema = {}
+        for fname, meta in data.get("field_schema", {}).items():
+            field_schema[fname] = {
+                "dtype": meta.get("dtype"),  # Already decoded by serial_utils
+                "shape": tuple(meta["shape"]) if meta.get("shape") else None,
+                "is_nested": meta.get("is_nested", False),
+                "is_non_tensor": meta.get("is_non_tensor", False),
+            }
+            if meta.get("per_sample_shapes"):
+                field_schema[fname]["per_sample_shapes"] = [tuple(s) for s in meta["per_sample_shapes"]]
+
+        # Reconstruct production_status
+        production_status = None
+        if data.get("production_status") is not None:
+            production_status = np.array(data["production_status"], dtype=np.int8)
+
         return cls(
-            samples=samples,
+            global_indexes=data["global_indexes"],
+            partition_ids=data["partition_ids"],
+            field_schema=field_schema,
+            production_status=production_status,
             extra_info=data.get("extra_info", {}),
+            _custom_meta=data.get("custom_meta", {}),
         )
-
-
-def _union_fields(fields1: dict[str, FieldMeta], fields2: dict[str, FieldMeta]) -> dict[str, FieldMeta]:
-    """Union two sample's fields. If fields overlap, the fields in fields1 will be replaced by fields2."""
-    for name in fields2.keys():
-        fields1[name] = fields2[name]
-    return fields1
-
-
-def _extract_field_metas(tensor_dict: TensorDict, set_all_ready: bool = True) -> list[dict[str, FieldMeta]]:
-    """
-    Extract field metas from a TensorDict. If data in tensor_dict does not have dtype or shape attribute,
-    the corresponding dtype or shape will be set to None.
-
-    Args:
-        tensor_dict (TensorDict): The input TensorDict.
-        set_all_ready (bool): If True, set all production_status to READY_FOR_CONSUME.
-                              Otherwise, set to NOT_PRODUCED. Default is True.
-
-    Returns:
-        all_fields (list[dict[str, FieldMeta]]): A list of dictionaries containing field metadata.
-    """
-    batch_size = tensor_dict.batch_size[0]
-
-    production_status = ProductionStatus.READY_FOR_CONSUME if set_all_ready else ProductionStatus.NOT_PRODUCED
-
-    all_fields = [
-        {
-            name: FieldMeta(
-                name=name,
-                dtype=getattr(value, "dtype", None),
-                shape=getattr(value, "shape", None),
-                production_status=production_status,
-            )
-            for name, value in tensor_dict[idx].items()
-        }
-        for idx in range(batch_size)
-    ]
-
-    return all_fields

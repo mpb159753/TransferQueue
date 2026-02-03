@@ -21,18 +21,22 @@ from .client import (
     process_zmq_server_info,
 )
 from .controller import TransferQueueController
+from .dataloader import StreamingDataLoader, StreamingDataset
 from .metadata import BatchMeta
 from .sampler import BaseSampler
 from .sampler.grpo_group_n_sampler import GRPOGroupNSampler
+from .sampler.rank_aware_sampler import RankAwareSampler
 from .sampler.sequential_sampler import SequentialSampler
 from .storage import SimpleStorageUnit
-from .utils.utils import get_placement_group
+from .utils.common import get_placement_group
 from .utils.zmq_utils import ZMQServerInfo
 
 __all__ = [
     "AsyncTransferQueueClient",
-    "BatchMeta",
     "TransferQueueClient",
+    "StreamingDataset",
+    "StreamingDataLoader",
+    "BatchMeta",
     "TransferQueueController",
     "SimpleStorageUnit",
     "ZMQServerInfo",
@@ -41,6 +45,7 @@ __all__ = [
     "BaseSampler",
     "GRPOGroupNSampler",
     "SequentialSampler",
+    "RankAwareSampler",
 ]
 
 version_folder = os.path.dirname(os.path.join(os.path.abspath(__file__)))

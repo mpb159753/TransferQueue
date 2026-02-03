@@ -17,9 +17,9 @@ SHARD_VARIANTS = [8]
 
 BRANCH_CONFIGS = [
     {"name": "optimized-v0.15", "path": "src_optimized", "env_vars": {}, "description": "Optimized"},
-    {"name": "main-no-zerocopy", "path": "src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "false"}, "description": "No ZeroCopy"},
-    {"name": "main-zerocopy", "path": "src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "true"}, "description": "ZeroCopy"},
-    {"name": "tensordock", "path": "src_td", "env_vars": {}, "description": "TensorDock"},
+    # {"name": "main-no-zerocopy", "path": "src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "false"}, "description": "No ZeroCopy"},
+    # {"name": "main-zerocopy", "path": "src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "true"}, "description": "ZeroCopy"},
+    # {"name": "tensordock", "path": "src_td", "env_vars": {}, "description": "TensorDock"},
 ]
 SCENARIOS = [{"name": "TransferQueue", "cmd_args": [], "env_vars": {"PYTHONPATH": "."}, "workdir": "."}]
 
@@ -129,33 +129,31 @@ def run_single_benchmark_local(scenario, config_name, run_id, rounds, shards, cp
     cmd.append(DOCKER_IMAGE)
     
     # Construct command to start Ray inside container
-    # Explicitly bind to specific IP to avoid wrong interface binding in multi-NIC env
     ray_start_cmd = ""
+    # Only start external Ray for distributed modes
     if role == "head":
         ray_start_cmd = f"ray start --head --node-ip-address={head_ip} --port={head_port} --num-cpus={int(cpu_limit)} --include-dashboard=false --disable-usage-stats --block & sleep 5 && "
     elif role == "worker":
-        # Worker connects to Head
         ray_start_cmd = f"ray start --address={head_ip}:{head_port} --node-ip-address={worker_ip} --num-cpus={int(cpu_limit)} --disable-usage-stats --block & sleep 5 && "
-    elif role == "single":
-        # Single mode: start head locally with specified port
-        ray_start_cmd = f"ray start --head --port={head_port} --num-cpus={int(cpu_limit)} --include-dashboard=false --disable-usage-stats --block & sleep 5 && "
+    # role == "single": do NOT start ray, let script handle it
 
     # Construct python command
-    py_cmd_str = f"python scripts/put_benchmark.py --config {config_name} --rounds {rounds} --shards {shards} --role {role}"
-    if role in ["single", "head"]:
-        py_cmd_str += " --output res.json"
-        # If head/single, we enable waiting for nodes if it's dual node
-        if role == "head":
-            py_cmd_str += " --wait-nodes 2"
+    # put_benchmark.py in refactor branch only accepts: --ip, --config, --output, --rounds, --shards, --profile
+    py_cmd_str = f"python scripts/put_benchmark.py --config {config_name} --rounds {rounds} --shards {shards}"
     
-    if head_ip:
-        py_cmd_str += f" --head-ip {head_ip}"
-    if worker_ip:
-        py_cmd_str += f" --worker-ip {worker_ip}"
-    
-    # Wrap in bash -c, and ensure ray stop is called at the end for cleanup
-    # Add sleep after ray stop to ensure ports are fully released before next test
-    final_cmd = ["/bin/bash", "-c", f"{ray_start_cmd}{py_cmd_str}; ray stop; sleep 2"]
+    if role == "single":
+         py_cmd_str += " --output res.json"
+         # No --role, No --ip (defaults to local init)
+    elif role == "head":
+        py_cmd_str += f" --output res.json --ip {head_ip}" 
+        # passing ip triggers address="auto", connecting to the ray started above
+    elif role == "worker":
+        # Worker doesn't run the python script main logic usually, but if it did:
+        py_cmd_str += f" --ip {head_ip}"
+
+    # Wrap in bash -c, to run ray stop only if ray started?
+    # Or just always run ray stop for safety (it will fail harmlessly if not started)
+    final_cmd = ["/bin/bash", "-c", f"{ray_start_cmd}{py_cmd_str}; ray stop || true; sleep 2"]
     cmd.extend(final_cmd)
     
     print(f"Running {branch_config['name']} - {config_name} [Role: {role}]...")
