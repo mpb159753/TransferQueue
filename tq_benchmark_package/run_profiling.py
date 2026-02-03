@@ -9,9 +9,8 @@ import shutil
 DOCKER_IMAGE = "run_test"
 
 BRANCH_CONFIGS = [
-    {"name": "optimized-v0.15", "path": "src_optimized", "env": {}},
-    {"name": "main-no-zerocopy", "path": "src_main", "env": {"TQ_ZERO_COPY_SERIALIZATION": "false"}},
-    {"name": "main-zerocopy", "path": "src_main", "env": {"TQ_ZERO_COPY_SERIALIZATION": "true"}},
+    {"name": "optimized-zerocopy", "path": "tq_benchmark_package/src_optimized", "env": {"TQ_ZERO_COPY_SERIALIZATION": "true"}},
+    {"name": "optimized-no-zerocopy", "path": "tq_benchmark_package/src_optimized", "env": {"TQ_ZERO_COPY_SERIALIZATION": "false"}},
 ]
 
 def run_profiling(config_name, round_count, branch_cfg, shards=8, cpu_limit=8):
@@ -26,7 +25,8 @@ def run_profiling(config_name, round_count, branch_cfg, shards=8, cpu_limit=8):
         "--config", config_name, 
         "--rounds", str(round_count), 
         "--shards", str(shards),
-        "--output", f"res_{timestamp}.json"
+        "--output", f"res_{timestamp}.json",
+        "--profile"  # Enable profiling synchronization
     ]
     
     # Wrapper cmd
@@ -62,11 +62,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="medium", help="Workload config size")
     parser.add_argument("--rounds", type=int, default=1, help="Rounds to run (keep small for profiling)")
+    parser.add_argument("--shards", type=int, default=8, help="Number of shards")
     args = parser.parse_args()
     
     for b in BRANCH_CONFIGS:
         if os.path.exists(b["path"]):
-            run_profiling(args.config, args.rounds, b)
+            run_profiling(args.config, args.rounds, b, shards=args.shards)
         else:
             print(f"Skipping missing path {b['path']}")
 
