@@ -16,10 +16,12 @@ ALL_CONFIGS = ["debug", "tiny", "small", "medium", "large", "xlarge", "huge"]
 SHARD_VARIANTS = [8]
 
 BRANCH_CONFIGS = [
-    {"name": "optimized-v0.15", "path": "tq_benchmark_package/src_optimized", "env_vars": {}, "description": "Optimized"},
-    {"name": "main-no-zerocopy", "path": "tq_benchmark_package/src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "false"}, "description": "No ZeroCopy"},
-    {"name": "main-zerocopy", "path": "tq_benchmark_package/src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "true"}, "description": "ZeroCopy"},
-    # {"name": "tensordock", "path": "src_td", "env_vars": {}, "description": "TensorDock"},
+    # enable-zero-copy-by-default branch: zero-copy is always on, no env-var toggle
+    {"name": "enable-zero-copy-by-default", "path": "tq_benchmark_package/src_zero_copy_default", "env_vars": {}, "description": "ZeroCopy-Default"},
+    # Reference baselines (commented out for this run)
+    # {"name": "optimized-v0.15", "path": "tq_benchmark_package/src_optimized", "env_vars": {}, "description": "Optimized"},
+    # {"name": "main-no-zerocopy", "path": "tq_benchmark_package/src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "false"}, "description": "No ZeroCopy"},
+    # {"name": "main-zerocopy", "path": "tq_benchmark_package/src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "true"}, "description": "ZeroCopy"},
 ]
 SCENARIOS = [{"name": "TransferQueue", "cmd_args": [], "env_vars": {"PYTHONPATH": "."}, "workdir": "."}]
 
