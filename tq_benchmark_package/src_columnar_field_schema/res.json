@@ -1,0 +1,28 @@
+[
+    {
+        "scenario": "TransferQueue",
+        "setting": "debug (Local)",
+        "data_volume": "0.05 MB",
+        "operation": "PUT",
+        "payload_gb": 4.57763671875e-05,
+        "stats_gbps": {
+            "mean": 0.043223712288864236,
+            "max": 0.07081277949379927,
+            "min": 0.019901271038208886,
+            "p99": 0.07017566563061498
+        }
+    },
+    {
+        "scenario": "TransferQueue",
+        "setting": "debug (Local)",
+        "data_volume": "0.05 MB",
+        "operation": "GET",
+        "payload_gb": 4.57763671875e-05,
+        "stats_gbps": {
+            "mean": 0.04580780243628187,
+            "max": 0.07759927250682025,
+            "min": 0.024543798536320348,
+            "p99": 0.07675289378199794
+        }
+    }
+]

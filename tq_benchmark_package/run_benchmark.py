@@ -16,12 +16,12 @@ ALL_CONFIGS = ["debug", "tiny", "small", "medium", "large", "xlarge", "huge"]
 SHARD_VARIANTS = [8]
 
 BRANCH_CONFIGS = [
-    # enable-zero-copy-by-default branch: zero-copy is always on, no env-var toggle
-    {"name": "enable-zero-copy-by-default", "path": "tq_benchmark_package/src_zero_copy_default", "env_vars": {}, "description": "ZeroCopy-Default"},
-    # Reference baselines (commented out for this run)
-    # {"name": "optimized-v0.15", "path": "tq_benchmark_package/src_optimized", "env_vars": {}, "description": "Optimized"},
-    # {"name": "main-no-zerocopy", "path": "tq_benchmark_package/src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "false"}, "description": "No ZeroCopy"},
-    # {"name": "main-zerocopy", "path": "tq_benchmark_package/src_main", "env_vars": {"TQ_ZERO_COPY_SERIALIZATION": "true"}, "description": "ZeroCopy"},
+    # Group 1: Pre-refactor baseline (commit 87d7e13)
+    {"name": "pre-refactor", "path": "tq_benchmark_package/src_pre_refactor", "env_vars": {"PYTHONPATH": "/app"}, "description": "Pre-Refactor"},
+    # Group 2: Columnar BatchMeta refactor (commit 6ad4d07)
+    {"name": "columnar-batch-meta", "path": "tq_benchmark_package/src_columnar_batch_meta", "env_vars": {"PYTHONPATH": "/app"}, "description": "Columnar-BatchMeta"},
+    # Group 3: Columnar FieldSchema refactor (refactor/columnar-field-schema branch latest)
+    {"name": "columnar-field-schema", "path": "tq_benchmark_package/src_columnar_field_schema", "env_vars": {"PYTHONPATH": "/app"}, "description": "Columnar-FieldSchema"},
 ]
 SCENARIOS = [{"name": "TransferQueue", "cmd_args": [], "env_vars": {"PYTHONPATH": "."}, "workdir": "."}]
 
