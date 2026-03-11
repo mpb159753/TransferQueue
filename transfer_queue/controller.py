@@ -193,7 +193,7 @@ class PartitionIndexManager:
 
 
 @dataclass
-class FieldColumnMeta:
+class FieldMeta:
     """
     Single source of truth for one field's metadata in a partition.
 
@@ -208,6 +208,43 @@ class FieldColumnMeta:
     is_non_tensor: bool = False
 
     per_sample_shapes: dict[int, tuple] = field(default_factory=dict)  # {global_idx: shape}
+
+    def update(self, incoming: dict[str, Any]) -> None:
+        """Update this field's metadata from an incoming schema dict.
+
+        Encapsulates dtype consistency check, shape conflict detection,
+        and automatic is_nested inference.
+
+        Args:
+            incoming: Schema dict with optional keys: dtype, shape, is_nested, is_non_tensor.
+
+        Raises:
+            ValueError: If incoming dtype conflicts with existing dtype.
+        """
+        # dtype consistency check
+        new_dtype = incoming.get("dtype")
+        if new_dtype is not None:
+            if self.dtype is None:
+                self.dtype = new_dtype
+            elif self.dtype != new_dtype:
+                raise ValueError(
+                    f"dtype mismatch: existing={self.dtype}, incoming={new_dtype}. "
+                    f"All batches for the same field must have the same dtype."
+                )
+
+        # shape consistency check → is_nested inference
+        new_shape = incoming.get("shape")
+        if new_shape is not None:
+            if self.shape is None and not self.is_nested:
+                self.shape = new_shape
+            elif self.shape is not None and self.shape != new_shape:
+                self.is_nested = True
+                self.shape = None
+
+        # explicit is_nested flag overrides inference
+        if incoming.get("is_nested"):
+            self.is_nested = True
+            self.shape = None
 
     def remove_samples(self, indexes: list[int]):
         """Remove sample-level data for the given indexes."""
@@ -260,8 +297,8 @@ class DataPartitionStatus:
 
     # Metadata
     field_name_mapping: dict[str, int] = field(default_factory=dict)  # field_name -> column_index
-    # O(F) columnar field metadata: field_name -> FieldColumnMeta
-    field_metadata: dict[str, FieldColumnMeta] = field(default_factory=dict)
+    # O(F) columnar field metadata: field_name -> FieldMeta
+    field_metadata: dict[str, FieldMeta] = field(default_factory=dict)
     field_custom_backend_meta: dict[int, dict[str, Any]] = field(
         default_factory=dict
     )  # global_idx -> {field: custom_backend_meta}
@@ -418,9 +455,13 @@ class DataPartitionStatus:
         Update production status for specific samples and fields.
         Handles dynamic expansion of both samples and fields.
 
+        Note: field_names is derived from field_schema.keys() internally.
+        The parameter is kept for backward compatibility but ignored;
+        callers should ensure field_schema contains all intended fields.
+
         Args:
             global_indices: List of sample indices to update
-            field_names: List of field names to mark as produced
+            field_names: List of field names (ignored; derived from field_schema.keys())
             field_schema: Columnar field schema {field_name: {dtype, shape, is_nested, ...}}
             custom_backend_meta: Optional per-sample per-field
                 custom metadata provided by storage backend
@@ -429,6 +470,9 @@ class DataPartitionStatus:
             True if update was successful, False on error
         """
         try:
+            # Derive field_names from field_schema to guarantee consistency
+            field_names = list(field_schema.keys())
+
             # Determine required capacity
             max_sample_idx = max(global_indices) if global_indices else -1
             required_samples = max_sample_idx + 1
@@ -438,11 +482,11 @@ class DataPartitionStatus:
                 self.ensure_samples_capacity(required_samples)
 
             # Register new fields if needed
-            new_fields = [field for field in field_names if field not in self.field_name_mapping]
+            new_fields = [f for f in field_names if f not in self.field_name_mapping]
             if new_fields:
                 # Add new fields to mapping
-                for field in new_fields:
-                    self.field_name_mapping[field] = len(self.field_name_mapping)
+                for f in new_fields:
+                    self.field_name_mapping[f] = len(self.field_name_mapping)
 
                 required_fields = len(self.field_name_mapping)
                 with self.data_status_lock:
@@ -478,39 +522,14 @@ class DataPartitionStatus:
 
         for field_name, meta in field_schema.items():
             if field_name not in self.field_metadata:
-                self.field_metadata[field_name] = FieldColumnMeta(
+                self.field_metadata[field_name] = FieldMeta(
                     dtype=meta.get("dtype"),
                     shape=meta.get("shape"),
                     is_nested=meta.get("is_nested", False),
                     is_non_tensor=meta.get("is_non_tensor", False),
                 )
             else:
-                col_meta = self.field_metadata[field_name]
-                # dtype consistency check
-                new_dtype = meta.get("dtype")
-                if new_dtype is not None:
-                    if col_meta.dtype is None:
-                        col_meta.dtype = new_dtype
-                    elif col_meta.dtype != new_dtype:
-                        raise ValueError(
-                            f"Field '{field_name}' dtype mismatch: "
-                            f"existing={col_meta.dtype}, incoming={new_dtype}. "
-                            f"All batches for the same field must have the same dtype."
-                        )
-
-                # shape consistency check → is_nested inference
-                new_shape = meta.get("shape")
-                if new_shape is not None:
-                    if col_meta.shape is None and not col_meta.is_nested:
-                        col_meta.shape = new_shape
-                    elif col_meta.shape is not None and col_meta.shape != new_shape:
-                        col_meta.is_nested = True
-                        col_meta.shape = None
-
-                # explicit is_nested flag overrides inference
-                if meta.get("is_nested"):
-                    col_meta.is_nested = True
-                    col_meta.shape = None
+                self.field_metadata[field_name].update(meta)
 
             # nested per-sample shapes
             per_sample_shapes = meta.get("per_sample_shapes")
@@ -703,7 +722,7 @@ class DataPartitionStatus:
     def get_field_schema(
         self, field_names: list[str], batch_global_indexes: list[int] | None = None
     ) -> dict[str, dict[str, Any]]:
-        """Return field_schema from the FieldColumnMeta store."""
+        """Return field_schema from the FieldMeta store."""
         gi = batch_global_indexes or []
         return {f: self.field_metadata[f].to_batch_schema(gi) for f in field_names if f in self.field_metadata}
 

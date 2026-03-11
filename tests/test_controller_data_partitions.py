@@ -156,7 +156,7 @@ def test_dynamic_expansion_scenarios():
     # Scenario 1: Adding samples with large gaps
     partition.update_production_status(
         global_indices=[0, 5, 10],
-        field_names=["field1"],
+        field_names=["field_1"],
         field_schema={
             "field_1": {"dtype": "torch.bool", "shape": (32,)},
         },
@@ -174,8 +174,8 @@ def test_dynamic_expansion_scenarios():
             field_schema={f"field_{i}": {"dtype": "torch.bool", "shape": (32,)}},
         )
 
-    assert partition.total_fields_num == 16  # Original + 15 new fields
-    assert partition.allocated_fields_num >= 16
+    assert partition.total_fields_num == 15  # field_1 from Scenario 1 + field_0..field_14 (field_1 overlaps)
+    assert partition.allocated_fields_num >= 15
 
     print("✓ Dynamic field expansion works")
 
@@ -214,7 +214,7 @@ def test_data_partition_status_advanced():
     field_schema = {f"dynamic_field_{s}": {"dtype": "torch.bool", "shape": (32,)} for s in ["a", "b", "c"]}
     partition.update_production_status(
         [0, 1, 2, 3, 4],
-        ["field_a", "field_b", "field_c"],
+        ["dynamic_field_a", "dynamic_field_b", "dynamic_field_c"],
         field_schema=field_schema,
     )
 
@@ -1048,13 +1048,13 @@ class TestDataPartitionStatusKvInterface:
         assert keys == ["key_1", "key_3"]
 
 
-class TestFieldColumnMeta:
-    """Unit tests for FieldColumnMeta dataclass."""
+class TestFieldMeta:
+    """Unit tests for FieldMeta dataclass."""
 
     def test_remove_samples(self):
-        from transfer_queue.controller import FieldColumnMeta
+        from transfer_queue.controller import FieldMeta
 
-        fm = FieldColumnMeta(is_nested=True)
+        fm = FieldMeta(is_nested=True)
         fm.per_sample_shapes = {0: (3,), 1: (5,), 2: (7,)}
         fm.remove_samples([0, 2])
         assert fm.per_sample_shapes == {1: (5,)}
@@ -1063,9 +1063,9 @@ class TestFieldColumnMeta:
         assert fm.per_sample_shapes == {1: (5,)}
 
     def test_to_batch_schema_regular(self):
-        from transfer_queue.controller import FieldColumnMeta
+        from transfer_queue.controller import FieldMeta
 
-        fm = FieldColumnMeta(dtype="torch.float32", shape=(512,), is_nested=False, is_non_tensor=False)
+        fm = FieldMeta(dtype="torch.float32", shape=(512,), is_nested=False, is_non_tensor=False)
         schema = fm.to_batch_schema([0, 1, 2])
         assert schema == {
             "dtype": "torch.float32",
@@ -1076,18 +1076,35 @@ class TestFieldColumnMeta:
         assert "per_sample_shapes" not in schema
 
     def test_to_batch_schema_nested(self):
-        from transfer_queue.controller import FieldColumnMeta
+        from transfer_queue.controller import FieldMeta
 
-        fm = FieldColumnMeta(dtype="torch.float32", shape=None, is_nested=True)
+        fm = FieldMeta(dtype="torch.float32", shape=None, is_nested=True)
         fm.per_sample_shapes = {0: (3,), 1: (5,), 2: (7,)}
         schema = fm.to_batch_schema([0, 2, 1])
         assert schema["is_nested"] is True
         assert schema["per_sample_shapes"] == [(3,), (7,), (5,)]
 
     def test_to_batch_schema_nested_missing_sample(self):
-        from transfer_queue.controller import FieldColumnMeta
+        from transfer_queue.controller import FieldMeta
 
-        fm = FieldColumnMeta(dtype="torch.float32", shape=None, is_nested=True)
+        fm = FieldMeta(dtype="torch.float32", shape=None, is_nested=True)
         fm.per_sample_shapes = {0: (3,)}
         schema = fm.to_batch_schema([0, 1])
         assert schema["per_sample_shapes"] == [(3,), None]
+
+    def test_update_dtype_conflict(self):
+        import pytest
+
+        from transfer_queue.controller import FieldMeta
+
+        fm = FieldMeta(dtype="torch.int32", shape=(16,))
+        with pytest.raises(ValueError, match="dtype mismatch"):
+            fm.update({"dtype": "torch.float64"})
+
+    def test_update_shape_conflict_promotes_nested(self):
+        from transfer_queue.controller import FieldMeta
+
+        fm = FieldMeta(dtype="torch.float32", shape=(256,))
+        fm.update({"dtype": "torch.float32", "shape": (128,)})
+        assert fm.is_nested is True
+        assert fm.shape is None

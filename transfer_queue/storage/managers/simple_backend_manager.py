@@ -20,6 +20,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Mapping
 from functools import wraps
+from operator import itemgetter
 from typing import Any, Callable, NamedTuple
 from uuid import uuid4
 
@@ -211,17 +212,23 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         Handles four data types:
         - Nested tensors: unbind → select → return as list
         - NonTensorStack: tolist → select → re-wrap
-        - list: direct index selection
+        - list: direct index selection via itemgetter
         - Regular tensors / numpy arrays: fancy indexing
         """
         if isinstance(field_data, torch.Tensor) and field_data.is_nested:
             unbound = field_data.unbind()
-            return [unbound[pos] for pos in positions]
+            getter = itemgetter(*positions) if len(positions) > 1 else lambda seq: (seq[positions[0]],)
+            selected = getter(unbound)
+            return list(selected)
         elif isinstance(field_data, NonTensorStack):
             items = field_data.tolist()
-            return NonTensorStack(*[items[pos] for pos in positions])
+            getter = itemgetter(*positions) if len(positions) > 1 else lambda seq: (seq[positions[0]],)
+            selected = getter(items)
+            return NonTensorStack(*selected)
         elif isinstance(field_data, list):
-            return [field_data[pos] for pos in positions]
+            getter = itemgetter(*positions) if len(positions) > 1 else lambda seq: (seq[positions[0]],)
+            selected = getter(field_data)
+            return list(selected)
         else:
             return field_data[positions]
 
