@@ -24,6 +24,7 @@ from operator import itemgetter
 from typing import Any, Callable, NamedTuple
 from uuid import uuid4
 
+import numpy as np
 import torch
 import zmq
 from omegaconf import DictConfig
@@ -344,6 +345,11 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             if all(v.shape == values[0].shape for v in values):
                 return torch.stack(values)
             return torch.nested.as_nested_tensor(values, layout=torch.jagged)
+        if all(isinstance(v, np.ndarray) for v in values):
+            # Detach numpy arrays from ZMQ frame memory (copy=False path).
+            # Use per-element .copy() instead of np.stack because string-dtype
+            # arrays may have heterogeneous shapes.
+            return NonTensorStack(*[v.copy() for v in values])
         return NonTensorStack(*values)
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
@@ -412,7 +418,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         )
         try:
             await socket.send_multipart(request_msg.serialize())
-            messages = await socket.recv_multipart()
+            messages = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(messages)
 
             if response_msg.request_type == ZMQRequestType.GET_DATA_RESPONSE:
