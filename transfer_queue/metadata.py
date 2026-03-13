@@ -659,22 +659,16 @@ class BatchMeta:
                         f"Missing from chunk: {set(base_fields) - set(chunk.field_names)}"
                     )
 
-            # Validate field_schema dtype and is_nested consistency across chunks
+            # Validate field_schema dtype consistency across chunks
             for field_name in base_fields:
                 base_meta = data[0].field_schema.get(field_name, {})
                 base_dtype = base_meta.get("dtype")
-                base_is_nested = base_meta.get("is_nested", False)
                 for i, chunk in enumerate(data[1:], start=1):
                     chunk_meta = chunk.field_schema.get(field_name, {})
                     if chunk_meta.get("dtype") != base_dtype:
                         raise ValueError(
                             f"Field '{field_name}' dtype mismatch in concat: "
                             f"chunk[0]={base_dtype}, chunk[{i}]={chunk_meta.get('dtype')}"
-                        )
-                    if chunk_meta.get("is_nested", False) != base_is_nested:
-                        raise ValueError(
-                            f"Field '{field_name}' is_nested mismatch in concat: "
-                            f"chunk[0]={base_is_nested}, chunk[{i}]={chunk_meta.get('is_nested', False)}"
                         )
 
         all_global_indexes = list(itertools.chain.from_iterable(chunk.global_indexes for chunk in data))
@@ -685,13 +679,21 @@ class BatchMeta:
         all_field_schema: dict[str, dict[str, Any]] = {}
         first_chunk = data[0]
         for field_name, meta in first_chunk.field_schema.items():
+            # Check if any chunk marks this field as nested
+            any_nested = any(chunk.field_schema.get(field_name, {}).get("is_nested", False) for chunk in data)
+            merged_is_nested = meta.get("is_nested", False) or any_nested
+
             all_field_schema[field_name] = {
                 "dtype": meta.get("dtype"),
-                "shape": meta.get("shape"),
-                "is_nested": meta.get("is_nested", False),
+                "shape": None if merged_is_nested else meta.get("shape"),
+                "is_nested": merged_is_nested,
                 "is_non_tensor": meta.get("is_non_tensor", False),
             }
-            if any(chunk.field_schema.get(field_name, {}).get("per_sample_shapes") for chunk in data):
+
+            # Build per_sample_shapes when the merged field is nested or any chunk already has them
+            if merged_is_nested or any(
+                chunk.field_schema.get(field_name, {}).get("per_sample_shapes") for chunk in data
+            ):
                 all_shapes = []
                 for chunk in data:
                     chunk_meta = chunk.field_schema.get(field_name, {})
@@ -699,7 +701,9 @@ class BatchMeta:
                     if chunk_shapes:
                         all_shapes.extend(chunk_shapes)
                     else:
-                        all_shapes.extend([None] * chunk.size)
+                        # Non-nested chunk: expand the uniform shape for each sample
+                        uniform_shape = chunk_meta.get("shape")
+                        all_shapes.extend([uniform_shape] * chunk.size)
                 all_field_schema[field_name]["per_sample_shapes"] = all_shapes
 
         all_custom_meta: list[dict[str, Any]] = []
