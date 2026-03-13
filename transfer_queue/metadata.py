@@ -257,6 +257,50 @@ class BatchMeta:
         """Check if all samples in this batch are ready for consumption"""
         return getattr(self, "_is_ready", False)
 
+    def get_dtypes(self, field_name: str) -> list:
+        """Return a per-sample list of dtypes for the given field.
+
+        Since dtype is uniform across all samples in a field, the returned list
+        contains the same dtype repeated ``self.size`` times.
+
+        Args:
+            field_name: Name of the field to query.
+
+        Returns:
+            A list of length ``self.size`` where each element is the field's dtype.
+
+        Raises:
+            KeyError: If *field_name* is not present in ``field_schema``.
+        """
+        if field_name not in self.field_schema:
+            raise KeyError(f"Field '{field_name}' not found in field_schema")
+        dtype = self.field_schema[field_name].get("dtype")
+        return [dtype] * self.size
+
+    def get_shapes(self, field_name: str) -> list:
+        """Return a per-sample list of shapes for the given field.
+
+        For nested-tensor fields the shapes come from ``per_sample_shapes``.
+        For regular (non-nested) fields the uniform ``shape`` is repeated
+        ``self.size`` times so the caller always gets one entry per sample.
+
+        Args:
+            field_name: Name of the field to query.
+
+        Returns:
+            A list of length ``self.size`` where each element is a shape tuple.
+
+        Raises:
+            KeyError: If *field_name* is not present in ``field_schema``.
+        """
+        if field_name not in self.field_schema:
+            raise KeyError(f"Field '{field_name}' not found in field_schema")
+        meta = self.field_schema[field_name]
+        per_sample = meta.get("per_sample_shapes")
+        if per_sample is not None:
+            return list(per_sample)
+        return [meta.get("shape")] * self.size
+
     # ==================== Extra Info Methods ====================
 
     def get_extra_info(self, key: str, default: Any = None) -> Any:
