@@ -19,6 +19,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+from transfer_queue.utils.compression import CompressedTensor, TensorCompressor
 from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 
@@ -1087,3 +1088,188 @@ class TestNumpySerialization:
         deserialized = decoder.decode(serialized)
         assert isinstance(deserialized, np.ndarray)
         assert np.array_equal(deserialized, arr)
+
+
+# ============================================================================
+# Compressed Tensor Serialization Tests
+# ============================================================================
+class TestCompressedFieldSerialization:
+    @staticmethod
+    def _make_zstd_compressor():
+        return TensorCompressor(algorithm="zstd", level=3, min_bytes=1)
+
+    def test_compressed_field_enc_dec_roundtrip(self):
+        compressor = self._make_zstd_compressor()
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
+
+        t = torch.randn(4, 128, 768, dtype=torch.float32)
+        serialized = encoder.encode(t)
+        result = decoder.decode(serialized)
+
+        assert isinstance(result, list)
+        assert len(result) == 4
+        for i in range(4):
+            assert torch.equal(result[i], t[i])
+
+    def test_compressed_field_su_passthrough(self):
+        zstd_compressor = self._make_zstd_compressor()
+
+        t = torch.randn(3, 64, 128, dtype=torch.float32)
+
+        encoder_put = MsgpackEncoder(compressor=zstd_compressor)
+        serialized = encoder_put.encode(t)
+
+        decoder_su = MsgpackDecoder(compressor=None)
+        su_received = decoder_su.decode(serialized)
+
+        assert isinstance(su_received, list)
+        assert len(su_received) == 3
+        for ct in su_received:
+            assert isinstance(ct, CompressedTensor)
+
+        raw_batch = []
+        for ct in su_received:
+            raw = zstd_compressor.decompress_bytes(ct.data)
+            dtype = getattr(torch, ct.dtype)
+            arr = torch.frombuffer(raw, dtype=torch.uint8)
+            raw_batch.append(arr.view(dtype).view(ct.shape))
+
+        for i in range(3):
+            assert torch.equal(raw_batch[i], t[i])
+
+        decoder_get = MsgpackDecoder(compressor=zstd_compressor)
+        result = decoder_get.decode(serialized)
+        assert isinstance(result, list)
+        assert len(result) == 3
+        for i in range(3):
+            assert torch.equal(result[i], t[i])
+
+    def test_mixed_compressed_uncompressed(self):
+        compressor = TensorCompressor(algorithm="zstd", level=3, min_bytes=100)
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
+
+        body = {
+            "large": torch.randn(3, 64, 128, dtype=torch.float32),
+            "small": torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float32),
+        }
+
+        serialized = encoder.encode(body)
+        result = decoder.decode(serialized)
+
+        assert isinstance(result["large"], list)
+        assert len(result["large"]) == 3
+        for i in range(3):
+            assert torch.equal(result["large"][i], body["large"][i])
+        assert isinstance(result["small"], torch.Tensor)
+        assert torch.equal(result["small"], body["small"])
+
+    def test_compressed_field_batch_size_1(self):
+        compressor = self._make_zstd_compressor()
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
+
+        t = torch.randn(1, 128, 256, dtype=torch.float32)
+        serialized = encoder.encode(t)
+        result = decoder.decode(serialized)
+
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert torch.equal(result[0], t[0])
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+            torch.float64,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.bool,
+        ],
+    )
+    def test_compressed_field_dtype_shape_preserved(self, dtype):
+        compressor = self._make_zstd_compressor()
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
+
+        if dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+            t = torch.randint(0, 10, (3, 64, 32), dtype=dtype)
+        elif dtype == torch.bool:
+            t = torch.randint(0, 2, (3, 64, 32), dtype=torch.bool)
+        else:
+            t = torch.randn(3, 64, 32, dtype=dtype)
+
+        serialized = encoder.encode(t)
+        result = decoder.decode(serialized)
+
+        assert isinstance(result, list)
+        assert len(result) == 3
+        for i in range(3):
+            assert result[i].dtype == t[i].dtype
+            assert result[i].shape == t[i].shape
+            assert torch.equal(result[i], t[i])
+
+    def test_compressed_special_values(self):
+        compressor = self._make_zstd_compressor()
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
+
+        t = torch.tensor(
+            [
+                [[float("inf"), float("-inf")], [float("nan"), 0.0]],
+                [[0.0, -0.0], [1e-10, -1e-10]],
+            ],
+            dtype=torch.float32,
+        )
+
+        serialized = encoder.encode(t)
+        result = decoder.decode(serialized)
+
+        assert isinstance(result, list)
+        assert len(result) == 2
+        for i in range(2):
+            assert torch.equal(torch.isnan(result[i]), torch.isnan(t[i]))
+            assert torch.equal(torch.isinf(result[i]), torch.isinf(t[i]))
+            mask = ~(torch.isnan(t[i]) | torch.isinf(t[i]))
+            if mask.any():
+                assert torch.equal(result[i][mask], t[i][mask])
+
+    def test_compressed_empty_field_skips(self):
+        compressor = self._make_zstd_compressor()
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
+
+        t = torch.randn(0, 64, 128, dtype=torch.float32)
+        serialized = encoder.encode(t)
+        result = decoder.decode(serialized)
+
+        assert isinstance(result, torch.Tensor)
+        assert result.shape == t.shape
+
+    def test_below_min_bytes_skips(self):
+        compressor = TensorCompressor(algorithm="zstd", level=3, min_bytes=500000)
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
+
+        t = torch.randn(4, 128, dtype=torch.float32)
+        serialized = encoder.encode(t)
+        result = decoder.decode(serialized)
+
+        assert isinstance(result, torch.Tensor)
+        assert torch.equal(result, t)
+
+
+def test_configure_serialization_warns_reconfig():
+    from transfer_queue.utils.serial_utils import configure_serialization
+
+    compressor = TensorCompressor(algorithm="zstd")
+    configure_serialization(compressor)
+
+    compressor2 = TensorCompressor(algorithm="zstd", level=5)
+    with pytest.warns(UserWarning, match="called more than once"):
+        configure_serialization(compressor2)

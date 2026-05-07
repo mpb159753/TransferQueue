@@ -52,6 +52,8 @@ def _encode_regular_tensor(self, obj):
 def _encode_compressed_rows(self, tensor: torch.Tensor) -> list[msgpack.Ext]:
     results = []
     for row in tensor:  # dim 0 iteration
+        if row.device.type != "cpu":
+            row = row.cpu()
         if not row.is_contiguous():
             row = row.contiguous()
         arr = row.flatten().view(torch.uint8).numpy()
@@ -62,11 +64,11 @@ def _encode_compressed_rows(self, tensor: torch.Tensor) -> list[msgpack.Ext]:
         self.aux_buffers.append(buf)
         dtype = str(row.dtype).removeprefix("torch.")
         meta = (dtype, tuple(row.shape), idx, self.compressor.algorithm, self.compressor.level)
-        results.append(msgpack.Ext(CUSTOM_TYPE_COMPRESSED_TENSOR, pickle.dumps(meta)))
+        results.append(msgpack.Ext(CUSTOM_TYPE_COMPRESSED_TENSOR, pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL)))
     return results
 ```
 
-**⚠️ 注意**: `row` 是 dim 0 的 slice，`tensor[0]` 的 `flatten+view` 本质上和 tensor storage 共享底层——但 `view(torch.uint8)` 已经在 `_encode_regular_tensor` 中有 `.numpy()` 这一步。压缩时如果我们先 `.numpy().tobytes()` 这会拷贝。但我们需要压缩，拷贝一次是可以接受的（本来就是压缩的对象）。关键是 `arr = row.flatten().view(torch.uint8).numpy()` → `raw = arr.tobytes()` — 这个拷贝是必需的，因为 zstd 需要 `bytes` 输入。
+**⚠️ 注意**: `row` 是 dim 0 的 slice，`tensor[0]` 的 `flatten+view` 本质上和 tensor storage 共享底层——但 `view(torch.uint8)` 已经在 `_encode_regular_tensor` 中有 `.numpy()` 这一步。压缩时如果我们先 `.numpy().tobytes()` 这会拷贝。但我们需要压缩，拷贝一次是可以接受的（本来就是压缩的对象）。关键是 `arr = row.flatten().view(torch.uint8).numpy()` → `raw = arr.tobytes()` — 这个拷贝是必需的，因为 zstd 需要 `bytes` 输入。GPU tensor 需先迁移到 CPU（`row.cpu()`），否则 `numpy()` 无法调用。
 
 新增 `_encode_compressed_tensor`（SU GET 路径所用）：
 

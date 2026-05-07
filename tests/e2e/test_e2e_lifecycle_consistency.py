@@ -25,6 +25,8 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData
 
+from transfer_queue.utils.compression import CompressedTensor
+
 # Module-level default fields to avoid repeated generation
 DEFAULT_FIELDS = [
     "tensor_f32",
@@ -910,3 +912,125 @@ def test_retrieved_data_writability_and_memory_safety(e2e_client):
 
 if __name__ == "__main__":
     sys.exit(pytest.main(["-v", __file__]))
+
+
+# ============================================================================
+# Compression E2E Tests
+# ============================================================================
+@pytest.fixture(scope="module")
+def e2e_client_zstd(ray_cluster, backend_name):
+    import transfer_queue
+
+    if backend_name != "SimpleStorage":
+        pytest.skip("Compression E2E tests require SimpleStorage backend")
+
+    import os
+
+    os.environ["TQ_COMPRESSION_ALGORITHM"] = "zstd"
+    os.environ["TQ_COMPRESSION_LEVEL"] = "3"
+
+    config = dict(BACKEND_CONFIGS[backend_name])
+    config = OmegaConf.create(config)
+
+    transfer_queue.init(config)
+    client = transfer_queue.get_client()
+    yield client
+    transfer_queue.close()
+
+    os.environ.pop("TQ_COMPRESSION_ALGORITHM", None)
+    os.environ.pop("TQ_COMPRESSION_LEVEL", None)
+
+
+class TestCompressionE2EConsistency:
+    def test_core_consistency_with_compression(self, e2e_client_zstd):
+        client = e2e_client_zstd
+        partition_id = "test_compression_core"
+        batch_size = 8
+        task_name = "compression_task"
+
+        indices = list(range(batch_size))
+        data = generate_complex_data(indices)
+        fields = DEFAULT_FIELDS
+
+        meta = client.put(data=data, partition_id=partition_id)
+        assert meta.size == batch_size
+
+        try:
+            retrieved_meta = poll_for_meta(client, partition_id, fields, batch_size, task_name, mode="fetch")
+            assert retrieved_meta is not None and retrieved_meta.size == batch_size
+
+            retrieved = client.get_data(retrieved_meta)
+
+            assert torch.allclose(retrieved["tensor_f32"], data["tensor_f32"])
+            assert torch.equal(retrieved["tensor_i64"], data["tensor_i64"])
+            assert torch.equal(retrieved["tensor_bf16"], data["tensor_bf16"])
+            assert torch.equal(retrieved["tensor_f16"], data["tensor_f16"])
+            assert verify_nested_tensor_equal(retrieved["nested_jagged"], data["nested_jagged"])
+            assert verify_nested_tensor_equal(retrieved["nested_strided"], data["nested_strided"])
+            assert verify_list_equal(retrieved["list_int"], data["list_int"])
+            assert verify_list_equal(retrieved["list_str"], data["list_str"])
+            assert np.allclose(retrieved["np_array"], data["np_array"])
+            assert verify_special_values(retrieved["special_val"], data["special_val"])
+            assert verify_non_tensor_data(retrieved["non_tensor_stack"], data["non_tensor_stack"])
+        finally:
+            client.clear_partition(partition_id)
+
+    def test_compression_su_no_zstd_calls(self, e2e_client_zstd, mocker):
+        from transfer_queue.utils.compression import TensorCompressor
+        from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+        compressor = TensorCompressor(algorithm="zstd", level=3, min_bytes=1)
+        encoder = MsgpackEncoder(compressor=compressor)
+
+        t = torch.randn(3, 128, 256, dtype=torch.float32)
+        serialized = encoder.encode(t)
+
+        decoder_su = MsgpackDecoder(compressor=None)
+        su_received = decoder_su.decode(serialized)
+
+        assert isinstance(su_received, list)
+        assert len(su_received) == 3
+        for ct in su_received:
+            assert isinstance(ct, CompressedTensor)
+
+        raw_batch = []
+        for ct in su_received:
+            raw = compressor.decompress_bytes(ct.data)
+            dtype = getattr(torch, ct.dtype)
+            arr = torch.frombuffer(raw, dtype=torch.uint8)
+            raw_batch.append(arr.view(dtype).view(ct.shape))
+
+        for i in range(3):
+            assert torch.equal(raw_batch[i], t[i])
+
+    def test_partial_put_compression(self, e2e_client_zstd):
+        client = e2e_client_zstd
+        partition_id = "test_compression_partial"
+        batch_size = 6
+        task_name = "compression_partial_task"
+
+        indices = list(range(batch_size))
+        full_data = generate_complex_data(indices)
+
+        set_a = ["tensor_f32", "tensor_i64", "special_val"]
+        set_b = ["tensor_bf16", "tensor_f16"]
+
+        meta = client.put(data=full_data.select(*set_a), partition_id=partition_id)
+        assert meta.size == batch_size
+
+        try:
+            assert client.check_production_status(data_fields=set_a, partition_id=partition_id)
+            assert not client.check_production_status(data_fields=set_b, partition_id=partition_id)
+
+            client.put(data=full_data.select(*set_b), metadata=meta)
+            assert client.check_production_status(data_fields=set_a + set_b, partition_id=partition_id)
+
+            all_fields = set_a + set_b
+            retrieved_meta = poll_for_meta(client, partition_id, all_fields, batch_size, task_name, mode="fetch")
+            assert retrieved_meta is not None
+
+            retrieved = client.get_data(retrieved_meta)
+            assert torch.allclose(retrieved["tensor_f32"], full_data["tensor_f32"])
+            assert torch.equal(retrieved["tensor_i64"], full_data["tensor_i64"])
+        finally:
+            client.clear_partition(partition_id)

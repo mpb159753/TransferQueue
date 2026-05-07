@@ -28,7 +28,9 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
+from transfer_queue.utils.compression import TensorCompressor
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.serial_utils import configure_serialization
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -84,6 +86,32 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
+
+        # === Tensor compression configuration ===
+        compression_cfg = config.get("compression", {})
+        algorithm = os.environ.get("TQ_COMPRESSION_ALGORITHM", compression_cfg.get("algorithm", "none"))
+        if algorithm != "none":
+            level = int(os.environ.get("TQ_COMPRESSION_LEVEL", compression_cfg.get("level", 3)))
+            min_bytes = int(os.environ.get("TQ_COMPRESSION_MIN_BYTES", compression_cfg.get("min_bytes", 1024)))
+
+            compressor = TensorCompressor(
+                algorithm=algorithm,
+                level=level,
+                min_bytes=min_bytes,
+            )
+            configure_serialization(compressor)
+
+            logger.info(
+                "Tensor compression enabled: algorithm=%s, level=%d, min_bytes=%d",
+                algorithm,
+                level,
+                min_bytes,
+            )
+            logger.warning(
+                "Tensor compression is enabled. Using a non-None data_parser with "
+                "put_data may produce unexpected results. Consider disabling "
+                "compression when using data_parser."
+            )
 
     def _register_servers(self, server_infos: "ZMQServerInfo | dict[Any, ZMQServerInfo]"):
         """Register and validate server information.
