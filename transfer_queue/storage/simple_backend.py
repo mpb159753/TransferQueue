@@ -27,6 +27,7 @@ import zmq
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import TransferQueueRole
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
+from transfer_queue.utils.trace_utils import TraceMarker, VizTracerProfileSession
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -174,6 +175,7 @@ class SimpleStorageUnit:
 
         self._init_zmq_socket()
         self._start_process_put_get()
+        self._trace_session: VizTracerProfileSession | None = None
 
         # Register finalizer for graceful cleanup when garbage collected
         self._finalizer = weakref.finalize(
@@ -238,6 +240,37 @@ class SimpleStorageUnit:
             daemon=True,
         )
         self.proxy_thread.start()
+
+    def configure_trace(
+        self,
+        output_dir: str,
+        component_name: str | None = None,
+        enabled: bool = False,
+        tracer_entries: int = 1_000_000,
+        min_duration_us: int = 0,
+    ) -> str:
+        resolved_component_name = component_name or f"storage_unit_{self.storage_unit_id.lower()}"
+        self._trace_session = VizTracerProfileSession(
+            output_dir=output_dir,
+            component_name=resolved_component_name,
+            enabled=enabled,
+            tracer_entries=tracer_entries,
+            min_duration_us=min_duration_us,
+            log_async=True,
+        )
+        return resolved_component_name
+
+    def start_trace(self, round_number: int) -> str | None:
+        if self._trace_session is None:
+            return None
+        output_path = self._trace_session.start(round_number)
+        return str(output_path) if output_path is not None else None
+
+    def stop_trace(self) -> str | None:
+        if self._trace_session is None:
+            return None
+        output_path = self._trace_session.stop()
+        return str(output_path) if output_path is not None else None
 
     def _proxy_routine(self) -> None:
         """ZMQ proxy for message forwarding between frontend ROUTER and backend DEALER."""
@@ -343,10 +376,11 @@ class SimpleStorageUnit:
         try:
             global_indexes = data_parts.body["global_indexes"]
             field_data = data_parts.body["data"]  # field_data should be a TensorDict.
-            with limit_pytorch_auto_parallel_threads(
-                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_put"
-            ):
-                self.storage_data.put_data(field_data, global_indexes)
+            with TraceMarker.scope("storage_put", storage_unit=self.storage_unit_id, indexes=len(global_indexes)):
+                with limit_pytorch_auto_parallel_threads(
+                    target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_put"
+                ):
+                    self.storage_data.put_data(field_data, global_indexes)
 
             # After put operation finish, send a message to the client
             response_msg = ZMQMessage.create(
@@ -380,10 +414,16 @@ class SimpleStorageUnit:
             fields = data_parts.body["fields"]
             global_indexes = data_parts.body["global_indexes"]
 
-            with limit_pytorch_auto_parallel_threads(
-                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
+            with TraceMarker.scope(
+                "storage_get",
+                storage_unit=self.storage_unit_id,
+                indexes=len(global_indexes),
+                fields=len(fields),
             ):
-                result_data = self.storage_data.get_data(fields, global_indexes)
+                with limit_pytorch_auto_parallel_threads(
+                    target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
+                ):
+                    result_data = self.storage_data.get_data(fields, global_indexes)
 
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]

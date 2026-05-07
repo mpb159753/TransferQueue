@@ -34,6 +34,7 @@ from transfer_queue.storage import (
     TransferQueueStorageManagerFactory,
 )
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
+from transfer_queue.utils.trace_utils import TraceMarker
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -216,23 +217,29 @@ class AsyncTransferQueueClient:
             >>> print(batch_meta.is_ready)  # May be False if some samples not ready
         """
         assert socket is not None
-        request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.GET_META,  # type: ignore[arg-type]
-            sender_id=self.client_id,
-            receiver_id=self._controller.id,
-            body={
-                "data_fields": data_fields,
-                "batch_size": batch_size,
-                "partition_id": partition_id,
-                "mode": mode,
-                "task_name": task_name,
-                "sampling_config": sampling_config,
-            },
-        )
+        with TraceMarker.scope(
+            "fetch_targets",
+            partition_id=partition_id,
+            mode=mode,
+            batch_size=batch_size,
+        ):
+            request_msg = ZMQMessage.create(
+                request_type=ZMQRequestType.GET_META,  # type: ignore[arg-type]
+                sender_id=self.client_id,
+                receiver_id=self._controller.id,
+                body={
+                    "data_fields": data_fields,
+                    "batch_size": batch_size,
+                    "partition_id": partition_id,
+                    "mode": mode,
+                    "task_name": task_name,
+                    "sampling_config": sampling_config,
+                },
+            )
 
-        await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart(copy=False)
-        response_msg = ZMQMessage.deserialize(response_serialized)
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
         logger.debug(
             f"[{self.client_id}]: Client get_meta response: {response_msg} from controller {self._controller.id}"
         )
@@ -398,12 +405,17 @@ class AsyncTransferQueueClient:
             if partition_id is None:
                 raise ValueError("partition_id must be provided if metadata is not given")
 
-            metadata = await self.async_get_meta(
-                data_fields=list(data.keys()),
-                batch_size=data.batch_size[0],
+            with TraceMarker.scope(
+                "allocate_indexes",
                 partition_id=partition_id,
-                mode="insert",
-            )
+                batch_size=int(data.batch_size[0]),
+            ):
+                metadata = await self.async_get_meta(
+                    data_fields=list(data.keys()),
+                    batch_size=data.batch_size[0],
+                    partition_id=partition_id,
+                    mode="insert",
+                )
 
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")

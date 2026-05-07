@@ -34,6 +34,7 @@ from torch import Tensor
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.factory import StorageClientFactory
+from transfer_queue.utils.trace_utils import TraceMarker
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket
 
 logger = logging.getLogger(__name__)
@@ -219,73 +220,80 @@ class TransferQueueStorageManager(ABC):
         try:
             sock.connect(self.controller_info.to_addr("data_status_update_socket"))
 
-            normalized_field_schema = {}
-            for field_name, field in field_schema.items():
-                # Work on a shallow copy to avoid mutating caller-provided schema
-                field_copy = field.copy()
-                per_sample_shapes = field_copy.get("per_sample_shapes", None)
-                if isinstance(per_sample_shapes, list | tuple):
-                    if len(per_sample_shapes) != len(global_indexes):
-                        raise ValueError(
-                            f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
-                            f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'; "
-                            f"skipping per_sample_shapes normalization."
-                        )
-                    else:
+            with TraceMarker.scope(
+                "status_update",
+                partition_id=partition_id,
+                indexes=len(global_indexes),
+                fields=len(field_schema),
+            ):
+                normalized_field_schema = {}
+                for field_name, field in field_schema.items():
+                    # Work on a shallow copy to avoid mutating caller-provided schema
+                    field_copy = field.copy()
+                    per_sample_shapes = field_copy.get("per_sample_shapes", None)
+                    if isinstance(per_sample_shapes, list | tuple):
+                        if len(per_sample_shapes) != len(global_indexes):
+                            raise ValueError(
+                                f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
+                                f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'; "
+                                f"skipping per_sample_shapes normalization."
+                            )
                         field_copy["per_sample_shapes"] = {
                             global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))
                         }
 
-                normalized_field_schema[field_name] = field_copy
+                    normalized_field_schema[field_name] = field_copy
 
-            # convert per_sample_shapes into dict
-            for field in field_schema.values():
-                per_sample_shapes = field.get("per_sample_shapes", None)
-                if per_sample_shapes:
-                    per_sample_shapes = {global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))}
-                    field["per_sample_shapes"] = per_sample_shapes
+                # convert per_sample_shapes into dict
+                for field in field_schema.values():
+                    per_sample_shapes = field.get("per_sample_shapes", None)
+                    if per_sample_shapes:
+                        per_sample_shapes = {
+                            global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))
+                        }
+                        field["per_sample_shapes"] = per_sample_shapes
 
-            request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,  # type: ignore[arg-type]
-                sender_id=self.storage_manager_id,
-                body={
-                    "partition_id": partition_id,
-                    "global_indexes": global_indexes,
-                    "field_schema": normalized_field_schema,
-                    "custom_backend_meta": custom_backend_meta,
-                },
-            ).serialize()
+                request_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,  # type: ignore[arg-type]
+                    sender_id=self.storage_manager_id,
+                    body={
+                        "partition_id": partition_id,
+                        "global_indexes": global_indexes,
+                        "field_schema": normalized_field_schema,
+                        "custom_backend_meta": custom_backend_meta,
+                    },
+                ).serialize()
 
-            await sock.send_multipart(request_msg)
-            logger.debug(
-                f"[{self.storage_manager_id}]: Send data status update request "
-                f"from storage manager id #{self.storage_manager_id} "
-                f"to controller id #{self.controller_info.id} successfully."
-            )
+                await sock.send_multipart(request_msg)
+                logger.debug(
+                    f"[{self.storage_manager_id}]: Send data status update request "
+                    f"from storage manager id #{self.storage_manager_id} "
+                    f"to controller id #{self.controller_info.id} successfully."
+                )
 
-            response_received = False
-            timeout = TQ_DATA_UPDATE_RESPONSE_TIMEOUT
+                response_received = False
+                timeout = TQ_DATA_UPDATE_RESPONSE_TIMEOUT
 
-            while not response_received and timeout > 0:
-                try:
-                    poll_interval = min(TQ_STORAGE_POLLER_TIMEOUT, timeout)
-                    messages = await asyncio.wait_for(sock.recv_multipart(copy=False), timeout=poll_interval)
-                    response_msg = ZMQMessage.deserialize(messages)
+                while not response_received and timeout > 0:
+                    try:
+                        poll_interval = min(TQ_STORAGE_POLLER_TIMEOUT, timeout)
+                        messages = await asyncio.wait_for(sock.recv_multipart(copy=False), timeout=poll_interval)
+                        response_msg = ZMQMessage.deserialize(messages)
 
-                    if response_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:  # type: ignore[arg-type]
-                        response_received = True
-                        logger.debug(
-                            f"[{self.storage_manager_id}]: Get data status update ACK response "
-                            f"from controller id #{response_msg.sender_id} successfully."
-                        )
-                except asyncio.TimeoutError:
-                    timeout -= poll_interval
-                except Exception as e:
-                    logger.warning(f"[{self.storage_manager_id}]: Error receiving response: {e}")
-                    break
+                        if response_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:  # type: ignore[arg-type]
+                            response_received = True
+                            logger.debug(
+                                f"[{self.storage_manager_id}]: Get data status update ACK response "
+                                f"from controller id #{response_msg.sender_id} successfully."
+                            )
+                    except asyncio.TimeoutError:
+                        timeout -= poll_interval
+                    except Exception as e:
+                        logger.warning(f"[{self.storage_manager_id}]: Error receiving response: {e}")
+                        break
 
-            if not response_received:
-                logger.error(f"[{self.storage_manager_id}]: Did not receive data status update ACK.")
+                if not response_received:
+                    logger.error(f"[{self.storage_manager_id}]: Did not receive data status update ACK.")
 
         except Exception as e:
             logger.error(f"[{self.storage_manager_id}]: Error during notify_data_update: {e}")

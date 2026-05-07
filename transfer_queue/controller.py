@@ -38,6 +38,7 @@ from transfer_queue.metadata import (
 from transfer_queue.sampler import BaseSampler, SequentialSampler
 from transfer_queue.utils.enum_utils import TransferQueueRole
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
+from transfer_queue.utils.trace_utils import TraceMarker, VizTracerProfileSession
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -99,38 +100,39 @@ class PartitionIndexManager:
         """
         if count <= 0:
             raise ValueError(f"Number of indexes needed must be larger than 0, but got {count}")
-        indexes = []
+        with TraceMarker.scope("allocate_indexes", partition_id=partition_id, count=count):
+            indexes = []
 
-        # Get indexes from reusable pool
-        if self.reusable_indexes:
-            # Calculate number of indexes needed from reusable pool
-            num_reuse = min(count, len(self.reusable_indexes))
+            # Get indexes from reusable pool
+            if self.reusable_indexes:
+                # Calculate number of indexes needed from reusable pool
+                num_reuse = min(count, len(self.reusable_indexes))
 
-            # Use slice operation to get multiple elements at once (FIFO principle)
-            indexes.extend(self.reusable_indexes[:num_reuse])
-            del self.reusable_indexes[:num_reuse]
+                # Use slice operation to get multiple elements at once (FIFO principle)
+                indexes.extend(self.reusable_indexes[:num_reuse])
+                del self.reusable_indexes[:num_reuse]
 
-        # If reusable pool doesn't have enough indexes, allocate new ones
-        if len(indexes) < count:
-            # Ensure newly allocated indexes don't conflict with existing ones
-            needed = count - len(indexes)
-            # Batch allocate consecutive index ranges
-            start_index = self.global_index_counter
-            end_index = start_index + needed
+            # If reusable pool doesn't have enough indexes, allocate new ones
+            if len(indexes) < count:
+                # Ensure newly allocated indexes don't conflict with existing ones
+                needed = count - len(indexes)
+                # Batch allocate consecutive index ranges
+                start_index = self.global_index_counter
+                end_index = start_index + needed
 
-            # Directly generate consecutive index list
-            new_indexes = list(range(start_index, end_index))
+                # Directly generate consecutive index list
+                new_indexes = list(range(start_index, end_index))
 
-            # Batch update status
-            self.allocated_indexes.update(new_indexes)
-            self.global_index_counter = end_index
+                # Batch update status
+                self.allocated_indexes.update(new_indexes)
+                self.global_index_counter = end_index
 
-            indexes.extend(new_indexes)
+                indexes.extend(new_indexes)
 
-        # Record partition-index relationship
-        self.partition_to_indexes[partition_id].update(indexes)
+            # Record partition-index relationship
+            self.partition_to_indexes[partition_id].update(indexes)
 
-        return indexes
+            return indexes
 
     def release_partition(self, partition_id) -> list[int]:
         """
@@ -1026,6 +1028,7 @@ class TransferQueueController:
 
         # Connected storage managers tracking
         self._connected_storage_managers: set[str] = set()
+        self._trace_session: VizTracerProfileSession | None = None
 
         # Start background processing threads
         self._start_process_handshake()
@@ -1033,6 +1036,36 @@ class TransferQueueController:
         self._start_process_request()
 
         logger.info(f"TransferQueue Controller {self.controller_id} initialized")
+
+    def configure_trace(
+        self,
+        output_dir: str,
+        component_name: str = "controller",
+        enabled: bool = False,
+        tracer_entries: int = 1_000_000,
+        min_duration_us: int = 0,
+    ) -> str:
+        self._trace_session = VizTracerProfileSession(
+            output_dir=output_dir,
+            component_name=component_name,
+            enabled=enabled,
+            tracer_entries=tracer_entries,
+            min_duration_us=min_duration_us,
+            log_async=True,
+        )
+        return component_name
+
+    def start_trace(self, round_number: int) -> str | None:
+        if self._trace_session is None:
+            return None
+        output_path = self._trace_session.start(round_number)
+        return str(output_path) if output_path is not None else None
+
+    def stop_trace(self) -> str | None:
+        if self._trace_session is None:
+            return None
+        output_path = self._trace_session.stop()
+        return str(output_path) if output_path is not None else None
 
     # ==================== Partition Management API ====================
 
@@ -1146,7 +1179,13 @@ class TransferQueueController:
             logger.error(f"Partition {partition_id} not found")
             return False
 
-        success = partition.update_production_status(global_indexes, field_names, field_schema, custom_backend_meta)
+        with TraceMarker.scope(
+            "status_update",
+            partition_id=partition_id,
+            indexes=len(global_indexes),
+            fields=len(field_names),
+        ):
+            success = partition.update_production_status(global_indexes, field_names, field_schema, custom_backend_meta)
         if success:
             logger.debug(
                 f"[{self.controller_id}]: Updated production status for partition {partition_id}: "
@@ -1305,58 +1344,70 @@ class TransferQueueController:
             if batch_size is None:
                 raise ValueError("must provide batch_size in fetch mode")
 
-            start_time = time.time()
-            while True:
-                # ready_for_consume_indexes: samples where all required fields are produced
-                # (production status is ready) and not yet consumed
-                ready_for_consume_indexes = self.scan_data_status(partition_id, data_fields, task_name)
+            with TraceMarker.scope(
+                "fetch_targets",
+                partition_id=partition_id,
+                batch_size=batch_size,
+                mode=mode,
+            ):
+                start_time = time.time()
+                while True:
+                    # ready_for_consume_indexes: samples where all required fields are produced
+                    # (production status is ready) and not yet consumed
+                    ready_for_consume_indexes = self.scan_data_status(partition_id, data_fields, task_name)
 
-                if len(ready_for_consume_indexes) < batch_size:
-                    if self.polling_mode:
-                        logger.debug(
-                            f"[{self.controller_id}]: Not enough data for task {task_name} in partition {partition_id}."
-                            f" Required: {batch_size}, Available: {len(ready_for_consume_indexes)}."
-                            f" Returning None due to polling mode."
+                    if len(ready_for_consume_indexes) < batch_size:
+                        if self.polling_mode:
+                            logger.debug(
+                                f"[{self.controller_id}]: Not enough data for task {task_name} in partition {partition_id}."
+                                f" Required: {batch_size}, Available: {len(ready_for_consume_indexes)}."
+                                f" Returning None due to polling mode."
+                            )
+                            return BatchMeta.empty()
+                        if time.time() - start_time > TQ_CONTROLLER_GET_METADATA_TIMEOUT:
+                            raise TimeoutError(
+                                f"Timeout while waiting for sufficient data for task {task_name}. "
+                                f"Required: {batch_size}, Available: {len(ready_for_consume_indexes)}"
+                            )
+                        logger.warning(
+                            f"[{self.controller_id}]: Insufficient data for task {task_name}. Required: {batch_size} "
+                            f"samples with fields {data_fields} in partition {partition_id}, but only have "
+                            f"{len(ready_for_consume_indexes)} samples meeting the criteria. "
+                            f"Retrying in {TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL}s..."
                         )
-                        return BatchMeta.empty()
-                    if time.time() - start_time > TQ_CONTROLLER_GET_METADATA_TIMEOUT:
-                        raise TimeoutError(
-                            f"Timeout while waiting for sufficient data for task {task_name}. "
-                            f"Required: {batch_size}, Available: {len(ready_for_consume_indexes)}"
-                        )
-                    logger.warning(
-                        f"[{self.controller_id}]: Insufficient data for task {task_name}. Required: {batch_size} "
-                        f"samples with fields {data_fields} in partition {partition_id}, but only have "
-                        f"{len(ready_for_consume_indexes)} samples meeting the criteria. "
-                        f"Retrying in {TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL}s..."
-                    )
-                    time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
-                else:
-                    break
+                        time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
+                    else:
+                        break
 
-            batch_global_indexes, consumed_indexes = self.sampler(
-                ready_for_consume_indexes,
-                batch_size,
-                **(sampling_config or {}),
-                **kwargs,
-            )
-
-            # Check if we got valid results from the sampler
-            if len(batch_global_indexes) != batch_size:
-                raise RuntimeError(
-                    f"Sampler returned insufficient samples. Please check the sampler logic. "
-                    f"Expected: {batch_size}, before sampling: {len(ready_for_consume_indexes)}, "
-                    f"after sampling: {len(batch_global_indexes)}"
+                batch_global_indexes, consumed_indexes = self.sampler(
+                    ready_for_consume_indexes,
+                    batch_size,
+                    **(sampling_config or {}),
+                    **kwargs,
                 )
 
-            # Mark samples as consumed if in fetch mode
-            if consumed_indexes:
-                partition = self.partitions[partition_id]
-                partition.mark_consumed(task_name, consumed_indexes)
+                # Check if we got valid results from the sampler
+                if len(batch_global_indexes) != batch_size:
+                    raise RuntimeError(
+                        f"Sampler returned insufficient samples. Please check the sampler logic. "
+                        f"Expected: {batch_size}, before sampling: {len(ready_for_consume_indexes)}, "
+                        f"after sampling: {len(batch_global_indexes)}"
+                    )
+
+                # Mark samples as consumed if in fetch mode
+                if consumed_indexes:
+                    partition = self.partitions[partition_id]
+                    partition.mark_consumed(task_name, consumed_indexes)
 
         elif mode == "force_fetch":
-            batch_global_indexes = self.index_manager.get_indexes_for_partition(partition_id)
-            consumed_indexes = []
+            with TraceMarker.scope(
+                "fetch_targets",
+                partition_id=partition_id,
+                batch_size=batch_size or 0,
+                mode=mode,
+            ):
+                batch_global_indexes = self.index_manager.get_indexes_for_partition(partition_id)
+                consumed_indexes = []
 
         # Package into metadata
         metadata = self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)

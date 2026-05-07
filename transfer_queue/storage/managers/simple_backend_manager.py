@@ -32,6 +32,7 @@ from tensordict import NonTensorStack, TensorDict
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import TransferQueueStorageManager
 from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
+from transfer_queue.utils.trace_utils import TraceMarker
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -306,7 +307,8 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         field_schema = extract_field_schema(data)
 
-        routing = self._group_by_hash(metadata.global_indexes)
+        with TraceMarker.scope("route_targets", samples=len(metadata.global_indexes), operation="put"):
+            routing = self._group_by_hash(metadata.global_indexes)
         tasks = [
             self._put_to_single_storage_unit(
                 group.global_indexes,
@@ -355,10 +357,27 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         )
 
         try:
-            data = request_msg.serialize()
-            await socket.send_multipart(data, copy=False)
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
+            with TraceMarker.scope(
+                "serialize_request",
+                storage_unit=target_storage_unit,
+                indexes=len(global_indexes),
+                operation="put",
+            ):
+                data = request_msg.serialize()
+            with TraceMarker.scope(
+                "send_request",
+                storage_unit=target_storage_unit,
+                indexes=len(global_indexes),
+                operation="put",
+            ):
+                await socket.send_multipart(data, copy=False)
+                messages = await socket.recv_multipart(copy=False)
+            with TraceMarker.scope(
+                "deserialize_response",
+                storage_unit=target_storage_unit,
+                operation="put",
+            ):
+                response_msg = ZMQMessage.deserialize(messages)
 
             if response_msg.request_type != ZMQRequestType.PUT_DATA_RESPONSE:
                 raise RuntimeError(
@@ -425,7 +444,8 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
 
-        routing = self._group_by_hash(metadata.global_indexes)
+        with TraceMarker.scope("route_targets", samples=len(metadata.global_indexes), operation="get"):
+            routing = self._group_by_hash(metadata.global_indexes)
 
         tasks = [
             self._get_from_single_storage_unit(group.global_indexes, metadata.field_names, target_storage_unit=su_id)
@@ -447,12 +467,13 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         n = len(metadata.global_indexes)
         ordered_data: dict[str, list] = {field: [None] * n for field in metadata.field_names}
 
-        for (su_id, group), (fields, su_data) in zip(routing.items(), results, strict=True):
-            for field in fields:
-                for i, pos in enumerate(group.batch_positions):
-                    ordered_data[field][pos] = su_data[field][i]
+        with TraceMarker.scope("aggregate_results", samples=n, fields=len(metadata.field_names)):
+            for (su_id, group), (fields, su_data) in zip(routing.items(), results, strict=True):
+                for field in fields:
+                    for i, pos in enumerate(group.batch_positions):
+                        ordered_data[field][pos] = su_data[field][i]
 
-        tensor_data = {field: self._pack_field_values(v) for field, v in ordered_data.items()}
+            tensor_data = {field: self._pack_field_values(v) for field, v in ordered_data.items()}
 
         return TensorDict(tensor_data, batch_size=len(metadata))
 
@@ -472,9 +493,27 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             body={"global_indexes": global_indexes, "fields": fields},
         )
         try:
-            await socket.send_multipart(request_msg.serialize())
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
+            with TraceMarker.scope(
+                "serialize_request",
+                storage_unit=target_storage_unit,
+                indexes=len(global_indexes),
+                operation="get",
+            ):
+                serialized_request = request_msg.serialize()
+            with TraceMarker.scope(
+                "send_request",
+                storage_unit=target_storage_unit,
+                indexes=len(global_indexes),
+                operation="get",
+            ):
+                await socket.send_multipart(serialized_request)
+                messages = await socket.recv_multipart(copy=False)
+            with TraceMarker.scope(
+                "deserialize_response",
+                storage_unit=target_storage_unit,
+                operation="get",
+            ):
+                response_msg = ZMQMessage.deserialize(messages)
 
             if response_msg.request_type == ZMQRequestType.GET_DATA_RESPONSE:
                 storage_unit_data = response_msg.body["data"]
