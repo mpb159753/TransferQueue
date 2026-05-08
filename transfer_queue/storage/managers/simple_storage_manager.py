@@ -28,7 +28,9 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
+from transfer_queue.utils.compression import TensorCompressor
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -84,6 +86,29 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
+
+        self.compressor = self._build_compressor(config)
+        # Per-instance encoder/decoder so colocated SU keeps using uncompressed defaults.
+        self._encoder = MsgpackEncoder(compressor=self.compressor)
+        self._decoder = MsgpackDecoder(compressor=self.compressor)
+        if self.compressor is not None and self.compressor.enabled:
+            logger.info(
+                "SimpleStorage tensor compression enabled: algorithm=%s, level=%d, min_bytes=%d",
+                self.compressor.algorithm,
+                self.compressor.level,
+                self.compressor.min_bytes,
+            )
+
+    @staticmethod
+    def _build_compressor(config: DictConfig) -> TensorCompressor | None:
+        """Build a ``TensorCompressor`` from config + env, or return ``None`` when disabled."""
+        compression_cfg = config.get("compression", {}) or {}
+        algorithm = os.environ.get("TQ_COMPRESSION_ALGORITHM", compression_cfg.get("algorithm", "none"))
+        if algorithm == "none":
+            return None
+        level = int(os.environ.get("TQ_COMPRESSION_LEVEL", compression_cfg.get("level", 3)))
+        min_bytes = int(os.environ.get("TQ_COMPRESSION_MIN_BYTES", compression_cfg.get("min_bytes", 1024)))
+        return TensorCompressor(algorithm=algorithm, level=level, min_bytes=min_bytes)
 
     def _register_servers(self, server_infos: "ZMQServerInfo | dict[Any, ZMQServerInfo]"):
         """Register and validate server information.
@@ -236,6 +261,12 @@ class AsyncSimpleStorageManager(StorageManager):
 
         logger.debug(f"[{self.storage_manager_id}]: receive put_data request, putting {metadata.size} samples.")
 
+        if data_parser is not None and self.compressor is not None and self.compressor.enabled:
+            raise ValueError(
+                "data_parser is not supported when SimpleStorage tensor compression is enabled. "
+                "Disable compression (TQ_COMPRESSION_ALGORITHM=none) or omit the data_parser argument."
+            )
+
         batch_size = metadata.size
 
         if batch_size == 0:
@@ -294,10 +325,10 @@ class AsyncSimpleStorageManager(StorageManager):
         )
 
         try:
-            data = request_msg.serialize()
+            data = request_msg.serialize(encoder=self._encoder)
             await socket.send_multipart(data, copy=False)
             messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
+            response_msg = ZMQMessage.deserialize(messages, decoder=self._decoder)
 
             if response_msg.request_type != ZMQRequestType.PUT_DATA_RESPONSE:
                 raise RuntimeError(
@@ -425,9 +456,9 @@ class AsyncSimpleStorageManager(StorageManager):
             body={"global_indexes": global_indexes, "fields": fields},
         )
         try:
-            await socket.send_multipart(request_msg.serialize())
+            await socket.send_multipart(request_msg.serialize(encoder=self._encoder))
             messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
+            response_msg = ZMQMessage.deserialize(messages, decoder=self._decoder)
 
             if response_msg.request_type == ZMQRequestType.GET_DATA_RESPONSE:
                 storage_unit_data = response_msg.body["data"]
@@ -491,9 +522,9 @@ class AsyncSimpleStorageManager(StorageManager):
                 body={"global_indexes": global_indexes},
             )
 
-            await socket.send_multipart(request_msg.serialize())
+            await socket.send_multipart(request_msg.serialize(encoder=self._encoder))
             messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
+            response_msg = ZMQMessage.deserialize(messages, decoder=self._decoder)
 
             if response_msg.request_type != ZMQRequestType.CLEAR_DATA_RESPONSE:
                 raise RuntimeError(

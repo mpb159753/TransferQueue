@@ -24,6 +24,7 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import AsyncSimpleStorageManager
+from transfer_queue.utils.compression import TensorCompressor
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
@@ -582,3 +583,56 @@ class TestPackFieldValues:
 
         assert isinstance(result, NonTensorStack)
         assert result.tolist() == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_put_data_raises_when_data_parser_combined_with_compression():
+    """put_data rejects data_parser when tensor compression is enabled."""
+    storage_unit_infos = {
+        "storage_0": ZMQServerInfo(
+            role=Role.STORAGE,
+            id="storage_0",
+            ip="127.0.0.1",
+            ports={"put_get_socket": 12345},
+        ),
+    }
+
+    controller_info = ZMQServerInfo(
+        role=Role.CONTROLLER,
+        id="controller_0",
+        ip="127.0.0.1",
+        ports={"handshake_socket": 12346, "data_status_update_socket": 12347},
+    )
+
+    config = {"zmq_info": storage_unit_infos}
+
+    with patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller") as mock_connect:
+        manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+        manager.storage_manager_id = "test_storage_manager"
+        manager.config = config
+        manager.controller_info = controller_info
+        manager.storage_unit_infos = storage_unit_infos
+        manager.data_status_update_socket = None
+        manager.controller_handshake_socket = None
+        manager.zmq_context = None
+        manager._connect_to_controller = mock_connect
+        manager.compressor = TensorCompressor(algorithm="zstd", level=3, min_bytes=1)
+
+        batch_meta = BatchMeta(
+            global_indexes=[0],
+            partition_ids=["0"],
+            field_schema={
+                "x": {
+                    "dtype": torch.float32,
+                    "shape": (1,),
+                    "is_nested": False,
+                    "is_non_tensor": False,
+                }
+            },
+            production_status=np.ones(1, dtype=np.int8),
+        )
+
+        data = TensorDict({"x": torch.randn(1, 1)}, batch_size=1)
+
+        with pytest.raises(ValueError, match="data_parser is not supported"):
+            await manager.put_data(data, batch_meta, data_parser=lambda d: d)

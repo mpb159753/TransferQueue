@@ -23,6 +23,15 @@ backend:
     num_data_storage_units: 2
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null
+    # Optional per-row tensor compression on the manager <-> storage-unit path.
+    # The storage unit never invokes the compression backend itself.
+    compression:
+      # "none" disables compression (default). Set to "zstd" to enable.
+      algorithm: none
+      # zstd level (1-22). Ignored when algorithm == "none".
+      level: 3
+      # Skip rows whose per-row payload (bytes) is below this threshold.
+      min_bytes: 1024
 
   # For MooncakeStore:
   MooncakeStore:

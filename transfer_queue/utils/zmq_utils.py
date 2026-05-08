@@ -27,7 +27,7 @@ import zmq.asyncio
 
 from transfer_queue.utils.enum_utils import ExplicitEnum, Role
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.serial_utils import decode, encode
+from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder, decode, encode
 
 logger = get_logger(__name__)
 
@@ -157,8 +157,11 @@ class ZMQMessage:
             timestamp=time.time(),
         )
 
-    def serialize(self) -> list:
-        """Serialize using zero-copy msgpack; falls back to pickle for unsupported types."""
+    def serialize(self, encoder: MsgpackEncoder | None = None) -> list:
+        """Serialize using zero-copy msgpack; falls back to pickle for unsupported types.
+
+        Pass ``encoder`` for compression-aware encoding.
+        """
         msg_dict = {
             "request_type": self.request_type.value,  # Enum -> str for msgpack
             "sender_id": self.sender_id,
@@ -167,15 +170,15 @@ class ZMQMessage:
             "timestamp": self.timestamp,
             "body": self.body,
         }
-        return encode(msg_dict)
+        return encode(msg_dict, encoder=encoder)
 
     @classmethod
-    def deserialize(cls, frames: list) -> "ZMQMessage":
-        """Deserialize: choose decoding path based on the first frame marker (zero-copy or pickle fallback)."""
+    def deserialize(cls, frames: list, decoder: MsgpackDecoder | None = None) -> "ZMQMessage":
+        """Deserialize frames (zero-copy or pickle fallback). Pass ``decoder`` for compression-aware decoding."""
         if not frames:
             raise ValueError("Empty frames received")
 
-        result = decode(frames)
+        result = decode(frames, decoder=decoder)
         return cls(
             request_type=ZMQRequestType(result["request_type"]),
             sender_id=result["sender_id"],

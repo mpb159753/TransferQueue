@@ -87,6 +87,11 @@ BACKEND_CONFIGS = {
     },
 }
 
+COMPRESSION_CONFIGS = {
+    "none": {"algorithm": "none"},
+    "zstd": {"algorithm": "zstd", "level": 3, "min_bytes": 256},
+}
+
 
 @pytest.fixture(scope="module")
 def ray_cluster():
@@ -113,20 +118,32 @@ def backend_name():
 
 
 @pytest.fixture(scope="module")
-def e2e_client(ray_cluster, backend_name):
+def compression_name():
+    return os.environ.get("TQ_TEST_COMPRESSION", "none")
+
+
+@pytest.fixture(scope="module")
+def e2e_client(ray_cluster, backend_name, compression_name):
     """Create a client using transfer_queue.init() for lifecycle testing.
 
     Args:
         ray_cluster: Ray cluster fixture
         backend_name: Backend name from TQ_TEST_BACKEND env var
+        compression_name: Compression preset from TQ_TEST_COMPRESSION env var
     """
     import transfer_queue
 
     if backend_name not in BACKEND_CONFIGS:
         raise ValueError(f"Unknown backend: {backend_name}. Available: {list(BACKEND_CONFIGS.keys())}")
 
-    config = BACKEND_CONFIGS[backend_name]
-    transfer_queue.init(OmegaConf.create(config))
+    config = OmegaConf.create(BACKEND_CONFIGS[backend_name])
+    if (
+        compression_name != "none"
+        and "compression" in COMPRESSION_CONFIGS.get(compression_name, {})
+        and config.backend.storage_backend == "SimpleStorage"
+    ):
+        config.backend.SimpleStorage.compression = COMPRESSION_CONFIGS[compression_name]
+    transfer_queue.init(config)
     client = transfer_queue.get_client()
     yield client
     transfer_queue.close()
@@ -906,6 +923,40 @@ def test_retrieved_data_writability_and_memory_safety(e2e_client):
 
     finally:
         client.clear_partition(partition_id)
+
+
+class TestCompressionE2E:
+    def test_mixed_field_roundtrip(self, e2e_client):
+        """Mix one large (compressed) field with one small field below min_bytes — both must round-trip."""
+        if os.environ.get("TQ_TEST_COMPRESSION", "none") != "none":
+            pytest.importorskip("zstandard")
+        client = e2e_client
+        partition_id = "compression_roundtrip"
+        batch_size = 8
+
+        large = torch.randn(batch_size, 256, dtype=torch.float32)
+        small = torch.randn(batch_size, 4, dtype=torch.float32)
+        ints = torch.arange(batch_size * 64, dtype=torch.int64).reshape(batch_size, 64)
+        data = TensorDict(
+            {"large": large, "small": small, "ints": ints},
+            batch_size=batch_size,
+        )
+
+        meta = client.put(data=data, partition_id=partition_id)
+        assert meta.size == batch_size
+
+        try:
+            retrieved_meta = poll_for_meta(
+                client, partition_id, ["large", "small", "ints"], batch_size, "compression_task"
+            )
+            assert retrieved_meta is not None and retrieved_meta.size == batch_size
+
+            retrieved = client.get_data(retrieved_meta)
+            assert torch.allclose(retrieved["large"], data["large"])
+            assert torch.allclose(retrieved["small"], data["small"])
+            assert torch.equal(retrieved["ints"], data["ints"])
+        finally:
+            client.clear_partition(partition_id)
 
 
 if __name__ == "__main__":
