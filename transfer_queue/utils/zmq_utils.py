@@ -13,30 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-import os
 import socket
 import time
 from dataclasses import dataclass
-from typing import Any, Optional, TypeAlias
+from functools import wraps
+from typing import Any, Callable, TypeAlias
 from uuid import uuid4
 
 import psutil
 import ray
 import zmq
-from ray.util import get_node_ip_address
+import zmq.asyncio
 
-from transfer_queue.utils.enum_utils import ExplicitEnum, TransferQueueRole
+from transfer_queue.utils.enum_utils import ExplicitEnum, Role
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.serial_utils import decode, encode
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
-
-# Ensure logger has a handler
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
+logger = get_logger(__name__)
 
 
 bytestr: TypeAlias = bytes | bytearray | memoryview
@@ -110,7 +103,7 @@ class ZMQServerInfo:
     TransferQueue server info class.
     """
 
-    def __init__(self, role: TransferQueueRole, id: str, ip: str, ports: dict[str, int]):
+    def __init__(self, role: Role, id: str, ip: str, ports: dict[str, int]):
         self.role = role
         self.id = id
         self.ip = ip
@@ -152,7 +145,7 @@ class ZMQMessage:
         request_type: ZMQRequestType,
         sender_id: str,
         body: dict[str, Any],
-        receiver_id: Optional[str] = None,
+        receiver_id: str | None = None,
     ) -> "ZMQMessage":
         """Create ZMQMessage."""
         return cls(
@@ -223,13 +216,13 @@ def format_zmq_address(ip: str, port: int) -> str:
         return f"tcp://{ip}:{port}"
 
 
-def get_node_ip_address_raw() -> str:
+def get_node_ip_address() -> str:
     """A wrapper around Ray's get_node_ip_address().
 
     This function intentionally returns a raw IPv4/IPv6 address WITHOUT brackets.
     """
 
-    return get_node_ip_address().strip("[]")
+    return ray.util.get_node_ip_address().strip("[]")
 
 
 def get_free_port(ip: str) -> int:
@@ -259,7 +252,7 @@ def create_zmq_socket(
     ctx: zmq.Context,
     socket_type: Any,
     ip: str,
-    identity: Optional[bytestr] = None,
+    identity: bytestr | None = None,
 ) -> zmq.Socket:
     """Create ZMQ socket.
 
@@ -301,13 +294,85 @@ def create_zmq_socket(
     return socket
 
 
-def process_zmq_server_info(
-    handlers: dict[Any, Any] | Any,
-):  # noqa: UP007
+def with_zmq_socket(
+    socket_name: str,
+    *,
+    get_identity: Callable[[Any], str],
+    get_peer: Callable[[Any, str | None], ZMQServerInfo],
+    resolve_target: Callable[[tuple, dict], str | None] | None = None,
+    timeout: int | None = None,
+):
+    """Create a reusable async decorator for request sockets.
+
+    This decorator encapsulates the common socket lifecycle used by both
+    client-side and storage-manager-side request paths:
+    create context/socket -> connect -> inject socket -> close/term.
+
+    Args:
+        socket_name: Socket port key in ``ZMQServerInfo.ports``.
+        get_identity: Callable that extracts owner identity from ``self``.
+            Example: ``lambda self: self.client_id``
+        get_peer: Callable that returns ``ZMQServerInfo`` for the target.
+            For single-target scenarios, ignore the target parameter.
+            Example: ``lambda self, target: self.server_info``
+            Example: ``lambda self, target: self.storage_unit_infos[target]``
+        resolve_target: Optional callable that extracts target identifier from
+            function arguments. Receives (args, kwargs) and returns target name.
+            Example: ``lambda args, kwargs: kwargs.get("target_storage_unit")``
+        timeout: Optional timeout (seconds) for both send/recv operations.
+    """
+
+    def decorator(func: Callable):
+        @wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            owner_id = get_identity(self)
+            if owner_id is None:
+                raise RuntimeError("get_identity returned None")
+
+            target_name: str | None = None
+            if resolve_target is not None:
+                target_name = resolve_target(args, kwargs)
+
+            server_info = get_peer(self, target_name)
+            if server_info is None:
+                raise RuntimeError(f"get_peer returned None for target '{target_name}'")
+
+            port = server_info.ports.get(socket_name)
+            if port is None:
+                raise RuntimeError(f"Socket '{socket_name}' not configured for server '{server_info.id}'")
+
+            context = zmq.asyncio.Context()
+            sock = None
+            try:
+                address = format_zmq_address(server_info.ip, port)
+                identity = f"{owner_id}_to_{server_info.id}_{uuid4().hex[:8]}".encode()
+                sock = create_zmq_socket(context, zmq.DEALER, server_info.ip, identity=identity)
+                sock.connect(address)
+                if timeout is not None:
+                    sock.setsockopt(zmq.RCVTIMEO, timeout * 1000)
+                    sock.setsockopt(zmq.SNDTIMEO, timeout * 1000)
+                kwargs["socket"] = sock
+                return await func(self, *args, **kwargs)
+            finally:
+                if sock is not None:
+                    try:
+                        if not sock.closed:
+                            sock.close(linger=-1)
+                    finally:
+                        context.term()
+                else:
+                    context.term()
+
+        return wrapper
+
+    return decorator
+
+
+def process_zmq_server_info(handlers: dict[Any, Any] | Any):
     """Extract ZMQ server information from handler objects.
 
     Args:
-        handlers: Dictionary of handler objects (controllers, storage managers, or storage units),
+        handlers: Dictionary of handler objects (controllers, storage managers or storage units),
                   or a single handler object
 
     Returns:
@@ -322,11 +387,9 @@ def process_zmq_server_info(
         >>> # Multiple handlers
         >>> handlers = {"storage_0": storage_0, "storage_1": storage_1}
         >>> info_dict = process_zmq_server_info(handlers)"""
-    # Handle single handler object case
     if not isinstance(handlers, dict):
         return ray.get(handlers.get_zmq_server_info.remote())  # type: ignore[union-attr, attr-defined]
     else:
-        # Handle dictionary case
         server_info = {}
         for name, handler in handlers.items():
             server_info[name] = ray.get(handler.get_zmq_server_info.remote())  # type: ignore[union-attr, attr-defined]

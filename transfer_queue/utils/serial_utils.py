@@ -17,8 +17,6 @@
 # This implementation is inspired by https://github.com/vllm-project/vllm/blob/main/vllm/v1/serial_utils.py
 
 
-import logging
-import os
 import pickle
 import warnings
 from collections.abc import Sequence
@@ -32,19 +30,22 @@ import zmq
 from msgspec import msgpack
 from tensordict import TensorDictBase
 
+from transfer_queue.utils.compression import CompressedTensor, TensorCompressor
+from transfer_queue.utils.logging_utils import get_logger
+
 CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_TENSOR = 3  # For tensor with buffer reference
 CUSTOM_TYPE_NESTED_TENSOR = 4  # For nested tensor (strided or jagged)
 CUSTOM_TYPE_NUMPY = 5  # For numpy ndarray with buffer reference
+CUSTOM_TYPE_COMPRESSED_TENSOR = 6  # For compressed tensor rows
 
 # 0xC1 is permanently reserved (invalid) in msgpack spec — safe to use as pickle fallback sentinel.
 _PICKLE_FALLBACK_SENTINEL = b"\xc1\xfe\xed"
 
 bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
+logger = get_logger(__name__)
 
 # Ignore warnings about non-writable buffers from torch.frombuffer. Upper codes will ensure
 # the tensors are writable to users.
@@ -65,7 +66,8 @@ class MsgpackEncoder:
 
     """
 
-    def __init__(self):
+    def __init__(self, compressor: TensorCompressor | None = None):
+        self.compressor = compressor
         self.encoder = msgpack.Encoder(enc_hook=self.enc_hook)
 
     @property
@@ -99,6 +101,9 @@ class MsgpackEncoder:
         - numpy.ndarray: Convert to tensor for unified handling
 
         """
+        if isinstance(obj, CompressedTensor):
+            return self._encode_compressed_tensor(obj)
+
         if isinstance(obj, torch.Tensor):
             return self._encode_tensor(obj)
 
@@ -194,18 +199,17 @@ class MsgpackEncoder:
 
     def _encode_regular_tensor(self, obj: torch.Tensor) -> msgpack.Ext:
         """Encode a regular (non-nested) tensor with zero-copy."""
-        # Handle non-contiguous tensors
+        if obj.is_sparse:
+            return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
+
+        if self.compressor is not None and self.compressor.should_compress_field(obj):
+            return self._encode_compressed_rows(obj)
 
         if not obj.is_contiguous():
             obj = obj.contiguous()
 
-        # Handle GPU tensors
         if obj.device.type != "cpu":
             obj = obj.cpu()
-
-        if obj.is_sparse:
-            # Sparse tensors fallback to pickle
-            return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
 
         # Note: view(uint8) is a byte-level view, NOT a value conversion.
         arr = obj.flatten().view(torch.uint8).numpy()
@@ -232,6 +236,43 @@ class MsgpackEncoder:
         meta = (str(obj.dtype), tuple(obj.shape), idx)
         return msgpack.Ext(CUSTOM_TYPE_NUMPY, pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL))
 
+    def _encode_compressed_rows(self, tensor: torch.Tensor) -> list[msgpack.Ext]:
+        assert self.compressor is not None
+        results = []
+        for row in tensor:
+            if row.device.type != "cpu":
+                row = row.cpu()
+            if not row.is_contiguous():
+                row = row.contiguous()
+            arr = row.flatten().view(torch.uint8).numpy()
+            raw = arr.tobytes()
+            compressed = self.compressor.compress_bytes(raw)
+            buf = memoryview(compressed)
+            idx = len(self.aux_buffers)
+            self.aux_buffers.append(buf)
+            dtype = str(row.dtype).removeprefix("torch.")
+            meta = (
+                dtype,
+                tuple(row.shape),
+                idx,
+                self.compressor.algorithm,
+                self.compressor.level,
+            )
+            results.append(
+                msgpack.Ext(
+                    CUSTOM_TYPE_COMPRESSED_TENSOR,
+                    pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL),
+                )
+            )
+        return results
+
+    def _encode_compressed_tensor(self, ct: CompressedTensor) -> msgpack.Ext:
+        buf = memoryview(ct.data)
+        idx = len(self.aux_buffers)
+        self.aux_buffers.append(buf)
+        meta = (ct.dtype, ct.shape, idx, ct.algorithm, ct.level)
+        return msgpack.Ext(CUSTOM_TYPE_COMPRESSED_TENSOR, pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL))
+
 
 class MsgpackDecoder:
     """Decoder with custom torch tensor and numpy array serialization.
@@ -241,7 +282,8 @@ class MsgpackDecoder:
     threads and async coroutines.
     """
 
-    def __init__(self):
+    def __init__(self, compressor: TensorCompressor | None = None):
+        self.compressor = compressor
         self.decoder = msgpack.Decoder(ext_hook=self.ext_hook)
 
     @property
@@ -334,6 +376,24 @@ class MsgpackDecoder:
         arr = np.frombuffer(buffer, dtype=np.uint8)
         return arr.view(np_dtype).reshape(shape)
 
+    def _decode_compressed_row(self, meta: tuple) -> CompressedTensor | torch.Tensor:
+        dtype_str, shape, idx, algorithm, level = meta
+        buffer = self.aux_buffers[idx]
+
+        if self.compressor is None:
+            return CompressedTensor(
+                data=bytes(buffer),
+                dtype=dtype_str,
+                shape=shape,
+                algorithm=algorithm,
+                level=level,
+            )
+        else:
+            raw = self.compressor.decompress_bytes(bytes(buffer))
+            torch_dtype = getattr(torch, dtype_str)
+            arr = torch.frombuffer(raw, dtype=torch.uint8)
+            return arr.view(torch_dtype).view(shape)
+
     def ext_hook(self, code: int, data: memoryview) -> Any:
         """Custom decoding hook for types msgspec doesn't natively support.
 
@@ -355,12 +415,31 @@ class MsgpackDecoder:
         if code == CUSTOM_TYPE_NUMPY:
             meta = pickle.loads(data)
             return self._decode_numpy(meta)
+        if code == CUSTOM_TYPE_COMPRESSED_TENSOR:
+            meta = pickle.loads(data)
+            return self._decode_compressed_row(meta)
 
         raise NotImplementedError(f"Extension type code {code} is not supported")
 
 
 _encoder = MsgpackEncoder()
 _decoder = MsgpackDecoder()
+
+
+_serialization_configured = False
+
+
+def configure_serialization(compressor: TensorCompressor | None):
+    global _encoder, _decoder, _serialization_configured
+    if _serialization_configured:
+        warnings.warn(
+            "configure_serialization called more than once. "
+            "Reconfiguring encoder/decoder with new compressor settings.",
+            stacklevel=2,
+        )
+    _encoder = MsgpackEncoder(compressor=compressor)
+    _decoder = MsgpackDecoder(compressor=compressor)
+    _serialization_configured = True
 
 
 def encode(obj: Any) -> list[bytestr]:

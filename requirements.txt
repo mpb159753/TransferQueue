@@ -6,3 +6,6 @@ numpy<2.0.0
 msgspec
 psutil
 omegaconf
+
+# Optional: tensor compression
+# zstandard>=0.22

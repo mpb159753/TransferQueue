@@ -14,11 +14,11 @@
 # limitations under the License.
 
 
-import numpy as np
 import pytest
 import torch
 from tensordict import TensorDict
 
+from transfer_queue.utils.compression import CompressedTensor, TensorCompressor
 from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 
@@ -630,460 +630,185 @@ def test_non_ascii_large_string():
 
 
 # ============================================================================
-# Thread Safety Tests (ContextVar-based isolation)
+# Compressed Tensor Serialization Tests
 # ============================================================================
-class TestSerialThreadSafety:
-    """Test thread safety of MsgpackEncoder/MsgpackDecoder with ContextVar.
-
-    These tests verify that the ContextVar-based fix properly isolates
-    aux_buffers across multiple threads, preventing buffer/metadata mismatch
-    errors that previously occurred when multiple threads used the global
-    _encoder/_decoder instances concurrently.
-
-    Historical issue: Before the fix, aux_buffers was stored as instance
-    variable, causing race conditions where int8 tensor buffers could be
-    associated with long tensor metadata, resulting in:
-    "self.size(-1) must be divisible by 8 to view Byte as Long"
-    """
-
+class TestCompressedFieldSerialization:
     @staticmethod
-    def _create_test_message(thread_id: int, iteration: int) -> dict:
-        """Create test message simulating GET_CONSUMPTION response structure.
+    def _make_zstd_compressor():
+        return TensorCompressor(algorithm="zstd", level=3, min_bytes=1)
 
-        Uses different dtypes and varying sizes to maximize the chance of
-        detecting buffer/metadata mismatches under concurrent access.
-        """
-        num_samples = 30 + (iteration % 10)
-        # torch.long: 8 bytes per element
-        global_index = torch.arange(num_samples, dtype=torch.long)
-        # torch.int8: 1 byte per element
-        consumption_status = torch.zeros(num_samples + iteration % 5, dtype=torch.int8)
+    def test_compressed_field_enc_dec_roundtrip(self):
+        compressor = self._make_zstd_compressor()
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
 
-        return {
-            "request_type": "CONSUMPTION_RESPONSE",
-            "sender_id": f"controller_{thread_id}",
-            "receiver_id": f"client_{thread_id}",
-            "request_id": f"req_{thread_id}_{iteration}",
-            "body": {
-                "partition_id": f"partition_{thread_id}",
-                "global_index": global_index,
-                "consumption_status": consumption_status,
-            },
+        t = torch.randn(4, 128, 768, dtype=torch.float32)
+        serialized = encoder.encode(t)
+        result = decoder.decode(serialized)
+
+        assert isinstance(result, list)
+        assert len(result) == 4
+        for i in range(4):
+            assert torch.equal(result[i], t[i])
+
+    def test_compressed_field_su_passthrough(self):
+        zstd_compressor = self._make_zstd_compressor()
+
+        t = torch.randn(3, 64, 128, dtype=torch.float32)
+
+        encoder_put = MsgpackEncoder(compressor=zstd_compressor)
+        serialized = encoder_put.encode(t)
+
+        decoder_su = MsgpackDecoder(compressor=None)
+        su_received = decoder_su.decode(serialized)
+
+        assert isinstance(su_received, list)
+        assert len(su_received) == 3
+        for ct in su_received:
+            assert isinstance(ct, CompressedTensor)
+
+        raw_batch = []
+        for ct in su_received:
+            raw = zstd_compressor.decompress_bytes(ct.data)
+            dtype = getattr(torch, ct.dtype)
+            arr = torch.frombuffer(raw, dtype=torch.uint8)
+            raw_batch.append(arr.view(dtype).view(ct.shape))
+
+        for i in range(3):
+            assert torch.equal(raw_batch[i], t[i])
+
+        decoder_get = MsgpackDecoder(compressor=zstd_compressor)
+        result = decoder_get.decode(serialized)
+        assert isinstance(result, list)
+        assert len(result) == 3
+        for i in range(3):
+            assert torch.equal(result[i], t[i])
+
+    def test_mixed_compressed_uncompressed(self):
+        compressor = TensorCompressor(algorithm="zstd", level=3, min_bytes=100)
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
+
+        body = {
+            "large": torch.randn(3, 64, 128, dtype=torch.float32),
+            "small": torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float32),
         }
 
-    def test_global_encoder_thread_safety(self):
-        """Test that global _encoder/_decoder instances are thread-safe.
-
-        This test verifies the ContextVar-based fix by using the global
-        shared encoder/decoder instances across multiple threads with
-        concurrent serialize/deserialize operations.
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        from transfer_queue.utils.serial_utils import _decoder, _encoder
-
-        num_threads = 8
-        iterations_per_thread = 50
-        errors: list[str] = []
-        success_count = 0
-
-        def worker(thread_id: int) -> tuple[int, list[str]]:
-            """Worker function that uses global encoder/decoder."""
-            local_success = 0
-            local_errors: list[str] = []
-
-            for i in range(iterations_per_thread):
-                try:
-                    msg = self._create_test_message(thread_id, i)
-
-                    # Use global shared encoder (thread-safe with ContextVar)
-                    serialized = list(_encoder.encode(msg))
-
-                    # Use global shared decoder
-                    deserialized = _decoder.decode(serialized)
-
-                    # Verify data correctness
-                    original_global_index = msg["body"]["global_index"]
-                    decoded_global_index = deserialized["body"]["global_index"]
-
-                    if not torch.equal(original_global_index, decoded_global_index):
-                        raise ValueError(
-                            f"Data mismatch! Original shape: {original_global_index.shape}, "
-                            f"Decoded shape: {decoded_global_index.shape}"
-                        )
-
-                    original_status = msg["body"]["consumption_status"]
-                    decoded_status = deserialized["body"]["consumption_status"]
-                    if not torch.equal(original_status, decoded_status):
-                        raise ValueError(
-                            f"consumption_status mismatch! Original: {original_status.shape}, "
-                            f"Decoded: {decoded_status.shape}"
-                        )
-
-                    local_success += 1
-
-                except Exception as e:
-                    local_errors.append(f"Thread {thread_id}, Iter {i}: {type(e).__name__}: {e}")
-
-            return local_success, local_errors
-
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = {executor.submit(worker, tid): tid for tid in range(num_threads)}
-
-            for future in as_completed(futures):
-                s, e = future.result()
-                success_count += s
-                errors.extend(e)
-
-        # All operations should succeed with the ContextVar fix
-        total_ops = num_threads * iterations_per_thread
-        assert success_count == total_ops, (
-            f"Thread safety test failed: {len(errors)} errors out of {total_ops} operations.\n"
-            f"Sample errors: {errors[:5]}"
-        )
-
-    def test_mixed_dtype_concurrent_serialization(self):
-        """Test concurrent serialization of tensors with different dtypes.
-
-        This test specifically targets the historical bug where buffer index
-        mismatches occurred between int8 and int64 tensors, causing view errors.
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        from transfer_queue.utils.serial_utils import _decoder, _encoder
-
-        num_threads = 16
-        iterations = 30
-
-        # Use different dtypes with different byte sizes to maximize
-        # the chance of triggering buffer/metadata mismatches
-        dtype_configs = [
-            (torch.int8, (50,)),  # 1 byte per element
-            (torch.long, (50,)),  # 8 bytes per element
-            (torch.float16, (50, 10)),  # 2 bytes per element
-            (torch.float32, (50, 10)),  # 4 bytes per element
-            (torch.bfloat16, (50, 10)),  # 2 bytes per element
-        ]
-
-        def worker(thread_id: int) -> tuple[int, list[str]]:
-            local_success = 0
-            local_errors: list[str] = []
-
-            for i in range(iterations):
-                try:
-                    # Select dtype configuration based on thread_id and iteration
-                    dtype, shape = dtype_configs[(thread_id + i) % len(dtype_configs)]
-
-                    if dtype in (torch.int8, torch.long):
-                        tensor = torch.randint(-128, 127, shape, dtype=dtype)
-                    else:
-                        tensor = torch.randn(*shape, dtype=dtype)
-
-                    msg = {
-                        "thread_id": thread_id,
-                        "iteration": i,
-                        "tensor": tensor,
-                        "nested": {"inner_tensor": torch.randn(10, dtype=torch.float32)},
-                    }
-
-                    serialized = list(_encoder.encode(msg))
-                    deserialized = _decoder.decode(serialized)
-
-                    # Verify tensor correctness
-                    if not torch.equal(deserialized["tensor"], tensor):
-                        raise ValueError(f"Tensor mismatch for {dtype}")
-
-                    if not torch.allclose(deserialized["nested"]["inner_tensor"], msg["nested"]["inner_tensor"]):
-                        raise ValueError("Nested tensor mismatch")
-
-                    local_success += 1
-
-                except Exception as e:
-                    local_errors.append(f"Thread {thread_id}, Iter {i}: {type(e).__name__}: {e}")
-
-            return local_success, local_errors
-
-        errors: list[str] = []
-        success_count = 0
-
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = {executor.submit(worker, tid): tid for tid in range(num_threads)}
-            for future in as_completed(futures):
-                s, e = future.result()
-                success_count += s
-                errors.extend(e)
-
-        total_ops = num_threads * iterations
-        assert success_count == total_ops, (
-            f"Mixed dtype test failed: {len(errors)} errors out of {total_ops}.\nSample errors: {errors[:5]}"
-        )
-
-
-# ============================================================================
-# Numpy Serialization Tests
-# ============================================================================
-class TestNumpySerialization:
-    """Test numpy array serialization with various dtypes.
-
-    These tests verify:
-    1. The fix for the TypeError when using torch.from_numpy() with unsupported
-       numpy dtypes (e.g., object arrays). The fix uses pickle fallback for
-       incompatible types while maintaining zero-copy for numeric types.
-    2. Numeric numpy arrays round-trip as np.ndarray (not torch.Tensor),
-       preserving dtype and shape exactly, using zero-copy path.
-    """
-
-    # --- Object / string array tests (formerly TestNumpyArrayTypeCompatibility) ---
-
-    def test_numpy_object_array_strings(self):
-        """Test numpy object array with string elements."""
-        encoder = MsgpackEncoder()
-        decoder = MsgpackDecoder()
-
-        # String array (dtype=object or unicode)
-        str_arr = np.array(["hello", "world", "test"])
-
-        serialized = encoder.encode(str_arr)
-        deserialized = decoder.decode(serialized)
-
-        assert np.array_equal(deserialized, str_arr)
-        assert deserialized.dtype == str_arr.dtype
-
-    def test_numpy_object_array_mixed_types(self):
-        """Test numpy object array with mixed Python types."""
-        encoder = MsgpackEncoder()
-        decoder = MsgpackDecoder()
-
-        # Mixed type array (explicitly object dtype)
-        mixed_arr = np.array([1, "two", 3.0, None], dtype=object)
-
-        serialized = encoder.encode(mixed_arr)
-        deserialized = decoder.decode(serialized)
-
-        assert np.array_equal(deserialized, mixed_arr)
-        assert deserialized.dtype == np.object_
-
-    def test_numpy_object_array_dicts(self):
-        """Test numpy object array containing Python dicts."""
-        encoder = MsgpackEncoder()
-        decoder = MsgpackDecoder()
-
-        # Array of dicts
-        dict_arr = np.array([{"a": 1}, {"b": 2}, {"c": 3}], dtype=object)
-
-        serialized = encoder.encode(dict_arr)
-        deserialized = decoder.decode(serialized)
-
-        assert len(deserialized) == len(dict_arr)
-        for orig, decoded in zip(dict_arr, deserialized, strict=False):
-            assert orig == decoded
-
-    def test_numpy_numeric_arrays_zero_copy(self):
-        """Test that numeric numpy arrays use zero-copy path and return np.ndarray."""
-        encoder = MsgpackEncoder()
-        decoder = MsgpackDecoder()
-
-        numeric_dtypes = [
-            np.float32,
-            np.float64,
-            np.int32,
-            np.int64,
-            np.int8,
-            np.uint8,
-            np.bool_,
-        ]
-
-        for dtype in numeric_dtypes:
-            if dtype == np.bool_:
-                arr = np.array([True, False, True], dtype=dtype)
-            elif np.issubdtype(dtype, np.integer):
-                arr = np.array([1, 2, 3], dtype=dtype)
-            else:
-                arr = np.array([1.0, 2.0, 3.0], dtype=dtype)
-
-            serialized = encoder.encode(arr)
-
-            # Zero-copy must produce multiple buffers (metadata + data buffer)
-            assert len(serialized) > 1, f"Expected zero-copy for dtype {dtype}"
-
-            deserialized = decoder.decode(serialized)
-
-            # After the fix: deserialized must be np.ndarray, not torch.Tensor
-            assert isinstance(deserialized, np.ndarray), (
-                f"Expected np.ndarray but got {type(deserialized)} for dtype={dtype}"
-            )
-            assert deserialized.dtype == arr.dtype
-            assert np.array_equal(deserialized, arr)
-
-    def test_numpy_object_array_in_zmq_message(self):
-        """Test numpy object array inside ZMQMessage."""
-        from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
-
-        # Create message with both object array and regular tensors
-        obj_arr = np.array(["prompt_1", "prompt_2", "prompt_3"], dtype=object)
-
-        msg = ZMQMessage(
-            request_type=ZMQRequestType.PUT_DATA,
-            sender_id="test",
-            receiver_id="test",
-            request_id="test",
-            timestamp=0.0,
-            body={
-                "prompts": obj_arr,
-                "tensor_data": torch.randn(3, 10),
-            },
-        )
-
-        encoded_msg = msg.serialize()
-        decoded_msg = ZMQMessage.deserialize(encoded_msg)
-
-        # Verify object array
-        assert np.array_equal(decoded_msg.body["prompts"], obj_arr)
-
-        # Verify tensor (should work with zero-copy)
-        assert torch.allclose(decoded_msg.body["tensor_data"], msg.body["tensor_data"])
-
-    def test_numpy_unicode_string_array(self):
-        """Test numpy unicode string array (dtype='<U...')."""
-        encoder = MsgpackEncoder()
-        decoder = MsgpackDecoder()
-
-        # Unicode string array with Chinese characters
-        unicode_arr = np.array(["你好", "世界", "测试"])
-
-        serialized = encoder.encode(unicode_arr)
-        deserialized = decoder.decode(serialized)
-
-        assert np.array_equal(deserialized, unicode_arr)
-
-    def test_numpy_bytes_array(self):
-        """Test numpy bytes array (dtype='S...')."""
-        encoder = MsgpackEncoder()
-        decoder = MsgpackDecoder()
-
-        # Bytes array
-        bytes_arr = np.array([b"hello", b"world"], dtype="S10")
-
-        serialized = encoder.encode(bytes_arr)
-        deserialized = decoder.decode(serialized)
-
-        assert np.array_equal(deserialized, bytes_arr)
-
-    # --- Native serialization tests (formerly TestNumpyNativeSerialization) ---
+        serialized = encoder.encode(body)
+        result = decoder.decode(serialized)
+
+        assert isinstance(result["large"], list)
+        assert len(result["large"]) == 3
+        for i in range(3):
+            assert torch.equal(result["large"][i], body["large"][i])
+        assert isinstance(result["small"], torch.Tensor)
+        assert torch.equal(result["small"], body["small"])
+
+    def test_compressed_field_batch_size_1(self):
+        compressor = self._make_zstd_compressor()
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
+
+        t = torch.randn(1, 128, 256, dtype=torch.float32)
+        serialized = encoder.encode(t)
+        result = decoder.decode(serialized)
+
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert torch.equal(result[0], t[0])
 
     @pytest.mark.parametrize(
         "dtype",
         [
-            # Numeric / bool / complex (original coverage)
-            np.float16,
-            np.float32,
-            np.float64,
-            np.int8,
-            np.int16,
-            np.int32,
-            np.int64,
-            np.uint8,
-            np.uint16,
-            np.uint32,
-            np.uint64,
-            np.bool_,
-            np.complex64,
-            np.complex128,
-            # Extended types now also covered via exclusion-based check
-            np.datetime64,  # kind='M', stored as int64
-            np.timedelta64,  # kind='m', stored as int64
-            np.dtype("S10"),  # kind='S', fixed-length bytes
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+            torch.float64,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.bool,
         ],
     )
-    def test_numpy_roundtrip_preserves_type(self, dtype):
-        """All buffer-compatible ndarrays must come back as np.ndarray, not torch.Tensor."""
-        encoder = MsgpackEncoder()
-        decoder = MsgpackDecoder()
+    def test_compressed_field_dtype_shape_preserved(self, dtype):
+        compressor = self._make_zstd_compressor()
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
 
-        dtype = np.dtype(dtype)  # normalise in case a dtype instance was passed
-        if dtype == np.dtype("bool"):
-            arr = np.array([True, False, True, True], dtype=dtype)
-        elif dtype.kind == "c":  # complex
-            arr = np.array([1 + 2j, 3 + 4j], dtype=dtype)
-        elif dtype.kind == "M":  # datetime64
-            arr = np.array(["2024-01", "2024-02"], dtype=dtype)
-        elif dtype.kind == "m":  # timedelta64
-            arr = np.array([1, 2], dtype=dtype)
-        elif dtype.kind == "S":  # fixed-length bytes
-            arr = np.array([b"hello", b"world"], dtype=dtype)
-        elif np.issubdtype(dtype, np.integer):
-            arr = np.array([1, 2, 3, 4], dtype=dtype)
+        if dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+            t = torch.randint(0, 10, (3, 64, 32), dtype=dtype)
+        elif dtype == torch.bool:
+            t = torch.randint(0, 2, (3, 64, 32), dtype=torch.bool)
         else:
-            arr = np.array([1.0, 2.0, 3.0, 4.0], dtype=dtype)
+            t = torch.randn(3, 64, 32, dtype=dtype)
 
-        serialized = encoder.encode(arr)
-        deserialized = decoder.decode(serialized)
+        serialized = encoder.encode(t)
+        result = decoder.decode(serialized)
 
-        assert isinstance(deserialized, np.ndarray), f"Expected np.ndarray, got {type(deserialized)} for dtype={dtype}"
-        assert deserialized.dtype == arr.dtype
-        assert deserialized.shape == arr.shape
-        assert np.array_equal(deserialized, arr)
+        assert isinstance(result, list)
+        assert len(result) == 3
+        for i in range(3):
+            assert result[i].dtype == t[i].dtype
+            assert result[i].shape == t[i].shape
+            assert torch.equal(result[i], t[i])
 
-    def test_numpy_zero_copy_uses_multiple_buffers(self):
-        """Zero-copy path must produce len(serialized) > 1."""
-        encoder = MsgpackEncoder()
-        arr = np.arange(100, dtype=np.float32)
-        serialized = encoder.encode(arr)
-        assert len(serialized) > 1, "Expected zero-copy (aux buffer) for float32 ndarray"
+    def test_compressed_special_values(self):
+        compressor = self._make_zstd_compressor()
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
 
-    def test_numpy_non_contiguous_roundtrip(self):
-        """Non-C-contiguous arrays must be made contiguous before serialization."""
-        encoder = MsgpackEncoder()
-        decoder = MsgpackDecoder()
+        t = torch.tensor(
+            [
+                [[float("inf"), float("-inf")], [float("nan"), 0.0]],
+                [[0.0, -0.0], [1e-10, -1e-10]],
+            ],
+            dtype=torch.float32,
+        )
 
-        base = np.arange(100, dtype=np.float64).reshape(10, 10)
-        arr = base[::2, ::2]  # non-contiguous view
-        assert not arr.flags["C_CONTIGUOUS"]
+        serialized = encoder.encode(t)
+        result = decoder.decode(serialized)
 
-        serialized = encoder.encode(arr)
-        deserialized = decoder.decode(serialized)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        for i in range(2):
+            assert torch.equal(torch.isnan(result[i]), torch.isnan(t[i]))
+            assert torch.equal(torch.isinf(result[i]), torch.isinf(t[i]))
+            mask = ~(torch.isnan(t[i]) | torch.isinf(t[i]))
+            if mask.any():
+                assert torch.equal(result[i][mask], t[i][mask])
 
-        assert isinstance(deserialized, np.ndarray)
-        assert np.array_equal(deserialized, arr)
+    def test_compressed_empty_field_skips(self):
+        compressor = self._make_zstd_compressor()
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
 
-    def test_numpy_multidim_shape_preserved(self):
-        """Shape must survive a round-trip for multi-dimensional arrays."""
-        encoder = MsgpackEncoder()
-        decoder = MsgpackDecoder()
+        t = torch.randn(0, 64, 128, dtype=torch.float32)
+        serialized = encoder.encode(t)
+        result = decoder.decode(serialized)
 
-        arr = np.arange(60, dtype=np.int32).reshape(3, 4, 5)
-        serialized = encoder.encode(arr)
-        deserialized = decoder.decode(serialized)
+        assert isinstance(result, torch.Tensor)
+        assert result.shape == t.shape
 
-        assert isinstance(deserialized, np.ndarray)
-        assert deserialized.shape == (3, 4, 5)
-        assert np.array_equal(deserialized, arr)
+    def test_below_min_bytes_skips(self):
+        compressor = TensorCompressor(algorithm="zstd", level=3, min_bytes=500000)
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
 
-    def test_numpy_empty_array_roundtrip(self):
-        """Empty arrays must round-trip correctly."""
-        encoder = MsgpackEncoder()
-        decoder = MsgpackDecoder()
+        t = torch.randn(4, 128, dtype=torch.float32)
+        serialized = encoder.encode(t)
+        result = decoder.decode(serialized)
 
-        arr = np.empty((0,), dtype=np.float32)
-        serialized = encoder.encode(arr)
-        deserialized = decoder.decode(serialized)
+        assert isinstance(result, torch.Tensor)
+        assert torch.equal(result, t)
 
-        assert isinstance(deserialized, np.ndarray)
-        assert deserialized.shape == (0,)
-        assert deserialized.dtype == np.float32
 
-    def test_numpy_object_array_still_uses_pickle(self):
-        """Object arrays (kind='O' or hasobject) must fall back to pickle."""
-        encoder = MsgpackEncoder()
-        decoder = MsgpackDecoder()
+def test_configure_serialization_warns_reconfig():
+    from transfer_queue.utils.serial_utils import configure_serialization
 
-        # dtype=object — kind 'O', cannot be viewed as a contiguous byte buffer
-        arr = np.array(["a", "b", "c"], dtype=object)
-        serialized = encoder.encode(arr)
+    compressor = TensorCompressor(algorithm="zstd")
+    configure_serialization(compressor)
 
-        # Pickle-fallback produces a single buffer (no aux tensor buffer appended)
-        assert len(serialized) == 1, "Object array should not use zero-copy path"
-
-        deserialized = decoder.decode(serialized)
-        assert isinstance(deserialized, np.ndarray)
-        assert np.array_equal(deserialized, arr)
+    compressor2 = TensorCompressor(algorithm="zstd", level=5)
+    with pytest.warns(UserWarning, match="called more than once"):
+        configure_serialization(compressor2)

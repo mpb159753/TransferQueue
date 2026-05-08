@@ -13,19 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-import os
 from typing import Any
 
-from transfer_queue.storage.managers.base import KVStorageManager
-from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
+from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import ZMQServerInfo
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
+logger = get_logger(__name__)
 
 
-@TransferQueueStorageManagerFactory.register("MooncakeStore")
+@StorageManagerFactory.register("MooncakeStore")
 class MooncakeStorageManager(KVStorageManager):
     """Storage manager for MooncakeStorage backend."""
 

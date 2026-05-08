@@ -13,19 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-import os
 import pickle
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch import Tensor
 
-from transfer_queue.storage.clients.base import TransferQueueStorageKVClient
-from transfer_queue.storage.clients.factory import StorageClientFactory
+from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVClient
+from transfer_queue.utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
+logger = get_logger(__name__)
 
 MOONCAKE_STORE_IMPORTED: bool = True
 try:
@@ -37,7 +34,7 @@ BATCH_SIZE_LIMIT: int = 500
 
 
 @StorageClientFactory.register("MooncakeStoreClient")
-class MooncakeStoreClient(TransferQueueStorageKVClient):
+class MooncakeStoreClient(StorageKVClient):
     """
     Storage client for MooncakeStore.
     """
@@ -62,9 +59,9 @@ class MooncakeStoreClient(TransferQueueStorageKVClient):
             self.device_name = ""
 
         if self.local_hostname is None or self.local_hostname == "":
-            from transfer_queue.utils.zmq_utils import get_node_ip_address_raw
+            from transfer_queue.utils.zmq_utils import get_node_ip_address
 
-            ip = get_node_ip_address_raw()
+            ip = get_node_ip_address()
             logger.info(f"Try to use Ray IP ({ip}) as local hostname for MooncakeStore.")
             self.local_hostname = ip
 
@@ -96,7 +93,7 @@ class MooncakeStoreClient(TransferQueueStorageKVClient):
         if ret != 0:
             raise RuntimeError(f"Mooncake store setup failed with error code: {ret}")
 
-    def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
+    def put(self, keys: list[str], values: list[Any]) -> list[Any] | None:
         """Stores multiple key-value pairs to MooncakeStore.
 
         Args:
@@ -156,7 +153,13 @@ class MooncakeStoreClient(TransferQueueStorageKVClient):
             if ret != 0:
                 raise RuntimeError(f"put_batch failed with error code: {ret}")
 
-    def get(self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None) -> list[Any]:
+    def get(
+        self,
+        keys: list[str],
+        shapes: list[Any] | None = None,
+        dtypes: list[Any] | None = None,
+        custom_backend_meta: list[str] | None = None,
+    ) -> list[Any]:
         """Get multiple key-value pairs from MooncakeStore.
 
         Args:
@@ -240,7 +243,7 @@ class MooncakeStoreClient(TransferQueueStorageKVClient):
             results.extend(batch_results)
         return results
 
-    def clear(self, keys: list[str], custom_backend_meta=None):
+    def clear(self, keys: list[str], custom_backend_meta: list[Any] | None = None) -> None:
         """Deletes multiple keys from MooncakeStore.
 
 
