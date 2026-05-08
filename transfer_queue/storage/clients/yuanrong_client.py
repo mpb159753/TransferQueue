@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-import os
 import struct
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -23,13 +21,12 @@ from typing import Any, Callable, Optional
 import torch
 from torch import Tensor
 
-from transfer_queue.storage.clients.base import TransferQueueStorageKVClient
-from transfer_queue.storage.clients.factory import StorageClientFactory
+from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVClient
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.serial_utils import _decoder, _encoder
 from transfer_queue.utils.yuanrong_utils import find_reachable_host
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
+logger = get_logger(__name__)
 
 
 YUANRONG_DATASYSTEM_IMPORTED: bool = True
@@ -57,7 +54,7 @@ class StorageStrategy(ABC):
         """Check if this strategy can store the given value."""
 
     @abstractmethod
-    def put(self, keys: list[str], values: list[Any]):
+    def put(self, keys: list[str], values: list[Any]) -> None:
         """Store key-value pairs using this strategy."""
 
     @abstractmethod
@@ -65,7 +62,7 @@ class StorageStrategy(ABC):
         """Check if this strategy can retrieve data with given tag."""
 
     @abstractmethod
-    def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]:
+    def get(self, keys: list[str], **kwargs) -> list[Any | None]:
         """Retrieve values by keys; kwargs may include shapes/dtypes."""
 
     @abstractmethod
@@ -73,7 +70,7 @@ class StorageStrategy(ABC):
         """Check if this strategy owns data identified by metadata."""
 
     @abstractmethod
-    def clear(self, keys: list[str]):
+    def clear(self, keys: list[str]) -> None:
         """Delete keys from storage."""
 
 
@@ -131,7 +128,7 @@ class NPUTensorKVClientAdapter(StorageStrategy):
         # Only contiguous NPU tensors are supported by this adapter.
         return value.is_contiguous()
 
-    def put(self, keys: list[str], values: list[Any]):
+    def put(self, keys: list[str], values: list[Any]) -> None:
         """Store NPU tensors in batches; deletes before overwrite."""
         for i in range(0, len(keys), self.KEYS_LIMIT):
             batch_keys = keys[i : i + self.KEYS_LIMIT]
@@ -147,7 +144,7 @@ class NPUTensorKVClientAdapter(StorageStrategy):
         """Matches 'DsTensorClient' Strategy tag."""
         return isinstance(strategy_tag, str) and strategy_tag == self.strategy_tag()
 
-    def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]:
+    def get(self, keys: list[str], **kwargs) -> list[Any | None]:
         """Fetch NPU tensors using pre-allocated empty buffers."""
         shapes = kwargs.get("shapes", None)
         dtypes = kwargs.get("dtypes", None)
@@ -169,14 +166,14 @@ class NPUTensorKVClientAdapter(StorageStrategy):
         """Matches 'DsTensorClient' strategy tag."""
         return isinstance(strategy_tag, str) and strategy_tag == self.strategy_tag()
 
-    def clear(self, keys: list[str]):
+    def clear(self, keys: list[str]) -> None:
         """Delete NPU tensor keys in batches."""
         for i in range(0, len(keys), self.KEYS_LIMIT):
             batch = keys[i : i + self.KEYS_LIMIT]
             # Todo(dpj): Test call clear when no (key,value) put in ds
             self._ds_client.delete(batch)
 
-    def _create_empty_npu_tensorlist(self, shapes: list, dtypes: list):
+    def _create_empty_npu_tensorlist(self, shapes: list[Any], dtypes: list[Any]) -> list[Tensor]:
         """
         Create a list of empty NPU tensors with given shapes and dtypes.
 
@@ -184,7 +181,7 @@ class NPUTensorKVClientAdapter(StorageStrategy):
             shapes (list): List of tensor shapes (e.g., [(3,), (2, 4)])
             dtypes (list): List of torch dtypes (e.g., [torch.float32, torch.int64])
         Returns:
-            list: List of uninitialized NPU tensors
+            list[Tensor]: List of uninitialized NPU tensors
         """
         tensors: list[Tensor] = []
         for shape, dtype in zip(shapes, dtypes, strict=True):
@@ -243,7 +240,7 @@ class GeneralKVClientAdapter(StorageStrategy):
         """Accepts any Python object."""
         return True
 
-    def put(self, keys: list[str], values: list[Any]):
+    def put(self, keys: list[str], values: list[Any]) -> None:
         """Store objects via zero-copy serialization in batches."""
         for i in range(0, len(keys), self.PUT_KEYS_LIMIT):
             batch_keys = keys[i : i + self.PUT_KEYS_LIMIT]
@@ -254,7 +251,7 @@ class GeneralKVClientAdapter(StorageStrategy):
         """Matches 'KVClient' strategy tag."""
         return isinstance(strategy_tag, str) and strategy_tag == self.strategy_tag()
 
-    def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]:
+    def get(self, keys: list[str], **kwargs) -> list[Any | None]:
         """Retrieve and deserialize objects in batches."""
         results = []
         for i in range(0, len(keys), self.GET_CLEAR_KEYS_LIMIT):
@@ -267,7 +264,7 @@ class GeneralKVClientAdapter(StorageStrategy):
         """Matches 'KVClient' strategy tag."""
         return isinstance(strategy_tag, str) and strategy_tag == self.strategy_tag()
 
-    def clear(self, keys: list[str]):
+    def clear(self, keys: list[str]) -> None:
         """Delete keys in batches."""
         for i in range(0, len(keys), self.GET_CLEAR_KEYS_LIMIT):
             batch_keys = keys[i : i + self.GET_CLEAR_KEYS_LIMIT]
@@ -367,7 +364,7 @@ class GeneralKVClientAdapter(StorageStrategy):
 
 
 @StorageClientFactory.register("YuanrongStorageClient")
-class YuanrongStorageClient(TransferQueueStorageKVClient):
+class YuanrongStorageClient(StorageKVClient):
     """
     Storage client for YuanRong DataSystem.
 
@@ -433,7 +430,13 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                 strategy_tags[original_index] = tag
         return strategy_tags
 
-    def get(self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None) -> list[Any]:
+    def get(
+        self,
+        keys: list[str],
+        shapes: list[Any] | None = None,
+        dtypes: list[Any] | None = None,
+        custom_backend_meta: list[str] | None = None,
+    ) -> list[Any]:
         """Retrieves multiple values from remote storage with expected metadata.
 
         Requires shape and dtype hints to reconstruct NPU tensors correctly.
@@ -472,7 +475,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                 results[original_index] = value
         return results
 
-    def clear(self, keys: list[str], custom_backend_meta=None):
+    def clear(self, keys: list[str], custom_backend_meta: list[str] | None = None) -> None:
         """Deletes multiple keys from remote storage.
 
         Args:
@@ -513,8 +516,8 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                    The order must correspond to the original keys.
             selector: A function that determines whether a strategy supports an item.
                      Signature: `(strategy: StorageStrategy, item: Any) -> bool`.
-            failback: If True, items that don't match any strategy will be ignored (not included in output).
-                      If False, a ValueError will be raised for any unmatched item.
+            ignore_unmatched: If True, items that don't match any strategy will be ignored (not included in output).
+                              If False, a ValueError will be raised for any unmatched item.
 
         Returns:
             A dictionary mapping each active strategy to a list of indexes in `items`

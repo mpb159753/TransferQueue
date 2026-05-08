@@ -15,7 +15,6 @@
 
 import argparse
 import asyncio
-import logging
 import os
 import random
 import time
@@ -32,9 +31,9 @@ from torch.utils.data import DataLoader, Dataset
 
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
+from transfer_queue.utils.logging_utils import get_logger
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 os.environ["RAY_DEDUP_LOGS"] = "0"
 os.environ["RAY_DEBUG"] = "1"
@@ -53,13 +52,24 @@ def compute_loss(data1, _data2):
 
 def compute_reward(response_ids: torch.Tensor) -> TensorDict:
     """Simulate a reward model that scores each token position in the response.
-
-    Returns a TensorDict with an ``"advantage"`` field whose shape matches
+    Returns a TensorDict with a ``"rm_score"`` field whose shape matches
     ``response_ids`` (i.e. one scalar per response token).
     """
     time.sleep(1)
-    advantage = torch.randn_like(response_ids, dtype=torch.float32)
-    return TensorDict({"advantage": advantage}, batch_size=response_ids.size(0))
+    reward = torch.randn_like(response_ids, dtype=torch.float32)
+
+    return TensorDict({"rm_score": reward}, batch_size=response_ids.size(0))
+
+
+def compute_advantage(rewards: torch.Tensor) -> TensorDict:
+    """Simulate the process of computing advantage.
+
+    Returns a TensorDict with an ``"advantage"`` field whose shape matches
+    ``rewards`` (i.e. one scalar per reward).
+    """
+    time.sleep(1)
+    advantage = torch.randn_like(rewards, dtype=torch.float32)
+    return TensorDict({"advantage": advantage}, batch_size=rewards.size(0))
 
 
 class TrainingWorker:
@@ -89,7 +99,7 @@ class TrainingWorker:
         """Simulate forward-only inference"""
         # 1. Pull data from storage
         data = tq.kv_batch_get_by_meta(meta=kv_meta)
-        logger.info(f"compute_log_prob: got data {data}")
+        logger.info(f"infer_batch: got data {data}")
 
         # 2. Model forward
         output = compute_log_prob(data["prompt_ids"], data["response_ids"])
@@ -493,6 +503,13 @@ class Trainer:
             reward_output = compute_reward(reward_data["response_ids"])
             meta = tq.kv_batch_put(keys=meta.keys, partition_id=meta.partition_id, fields=reward_output)
             logger.info(f"demo reward KVBatchMeta: {meta}")
+
+            # ========================= Compute advantage =========================
+            meta.fields = ["response_ids", "ref_log_prob", "old_log_prob", "rm_score"]
+            advantage_data = tq.kv_batch_get_by_meta(meta=meta)
+            advantage_output = compute_advantage(advantage_data["rm_score"])
+            meta = tq.kv_batch_put(keys=meta.keys, partition_id=meta.partition_id, fields=advantage_output)
+            logger.info(f"demo advantage KVBatchMeta: {meta}")
 
             # ========================= Update actor =========================
             meta.fields = [

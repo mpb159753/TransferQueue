@@ -15,13 +15,12 @@
 
 import asyncio
 import itertools
-import logging
 import os
 import time
 import weakref
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 from uuid import uuid4
 
 import ray
@@ -33,17 +32,11 @@ from tensordict import NonTensorStack, TensorDict
 from torch import Tensor
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
-from transfer_queue.storage.clients.factory import StorageClientFactory
+from transfer_queue.storage.clients.base import StorageClientFactory
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
-
-# Ensure logger has a handler
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
+logger = get_logger(__name__)
 
 # ZMQ timeouts (in seconds) and retry configurations
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))
@@ -56,7 +49,7 @@ LIMIT_THREADS_PER_MANAGER_IN_DRIVER = 8
 LIMIT_THREADS_PER_MANAGER_IN_RAY_ACTOR = 4
 
 
-class TransferQueueStorageManager(ABC):
+class StorageManager(ABC):
     """Base class for storage layer. It defines the interface for data operations and
     generally provides handshake & notification capabilities."""
 
@@ -66,9 +59,9 @@ class TransferQueueStorageManager(ABC):
         self.controller_info = controller_info
 
         # Handshake socket is sync (used only during initialization)
-        self.controller_handshake_socket: Optional[zmq.Socket] = None
+        self.controller_handshake_socket: zmq.Socket | None = None
 
-        self.zmq_context: Optional[zmq.asyncio.Context] = None
+        self.zmq_context: zmq.asyncio.Context | None = None
         self._connect_to_controller()
 
     def _connect_to_controller(self) -> None:
@@ -196,7 +189,7 @@ class TransferQueueStorageManager(ABC):
         partition_id: str,
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
     ) -> None:
         """
         Notify controller that new data is ready.
@@ -307,7 +300,7 @@ class TransferQueueStorageManager(ABC):
 
     @abstractmethod
     async def put_data(
-        self, data: TensorDict, metadata: BatchMeta, data_parser: Optional[Callable[[Any], Any]] = None
+        self, data: TensorDict, metadata: BatchMeta, data_parser: Callable[[Any], Any] | None = None
     ) -> None:
         """
         Put data into the storage backend.
@@ -371,11 +364,36 @@ class TransferQueueStorageManager(ABC):
             logger.error(f"[{self.storage_manager_id}]: Exception during __del__: {str(e)}")
 
 
-from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory  # noqa: E402
+class StorageManagerFactory:
+    """Factory that creates a StorageManager instance."""
+
+    _registry: dict[str, type[StorageManager]] = {}
+
+    @classmethod
+    def register(cls, manager_type: str):
+        """Register a StorageManager class."""
+
+        def decorator(manager_cls: type[StorageManager]):
+            if not issubclass(manager_cls, StorageManager):
+                raise TypeError(
+                    f"manager_cls {getattr(manager_cls, '__name__', repr(manager_cls))} must be "
+                    f"a subclass of StorageManager"
+                )
+            cls._registry[manager_type] = manager_cls
+            return manager_cls
+
+        return decorator
+
+    @classmethod
+    def create(cls, manager_type: str, controller_info: ZMQServerInfo, config: dict[str, Any]) -> StorageManager:
+        """Create and return a StorageManager instance."""
+        assert manager_type in cls._registry, (
+            f"Unknown manager_type: {manager_type}. Supported managers include: {list(cls._registry.keys())}"
+        )
+        return cls._registry[manager_type](controller_info, config)
 
 
-@TransferQueueStorageManagerFactory.register("KVStorageManager")
-class KVStorageManager(TransferQueueStorageManager):
+class KVStorageManager(StorageManager):
     """
     A storage manager that uses a key-value (KV) backend (e.g., YuanRong) to store and retrieve tensor data.
     It maps structured metadata (BatchMeta) to flat lists of keys and values for efficient KV operations.
@@ -390,7 +408,7 @@ class KVStorageManager(TransferQueueStorageManager):
             raise ValueError("Missing client_name in config")
         super().__init__(controller_info, config)
         self.storage_client = StorageClientFactory.create(client_name, config)
-        self._multi_threads_executor: Optional[ThreadPoolExecutor] = None
+        self._multi_threads_executor: ThreadPoolExecutor | None = None
         self._executor_finalizer = weakref.finalize(self, self._shutdown_executor, self._multi_threads_executor)
 
     @staticmethod
@@ -412,19 +430,20 @@ class KVStorageManager(TransferQueueStorageManager):
         return [pfx + sfx for sfx, pfx in itertools.product(keys_suffixes, keys_prefixes)]
 
     @staticmethod
-    def _generate_values(data: TensorDict) -> list[Tensor]:
+    def _generate_values(data: TensorDict) -> list[Any]:
         """
-        Extract and flatten tensor values from a TensorDict in field-major order.
+        Extract and flatten values from a TensorDict in field-major order.
         Values are ordered by sorted field names, then by row (sample) order within each field.
         This matches the key order generated by `_generate_keys`.
 
         Args:
-            data (TensorDict): Input data where keys are field names and values are tensors.
+            data (TensorDict): Input data where keys are field names and values are tensors or any type
+                               wrapped by NonTensorStack.
         Returns:
-            list[Tensor]: Flattened list of tensors, e.g.,
-                          [data[field_a][0], data[field_a][1], data[field_a][2], ..., data[field_b][0], ...]
+            list[Any]: Flattened list of values, e.g.,
+                       [data[field_a][0], data[field_a][1], data[field_a][2], ..., data[field_b][0], ...]
         """
-        results: list[Tensor] = []
+        results: list[Any] = []
         for field in sorted(data.keys()):
             field_data = data[field]
             if isinstance(field_data, Tensor) and field_data.is_nested:
@@ -434,7 +453,7 @@ class KVStorageManager(TransferQueueStorageManager):
         return results
 
     @staticmethod
-    def _shutdown_executor(thread_executor: Optional[ThreadPoolExecutor]) -> None:
+    def _shutdown_executor(thread_executor: ThreadPoolExecutor | None) -> None:
         """
         A static method to ensure no strong reference to 'self' is held within the
         finalizer's callback, enabling proper garbage collection.
@@ -468,17 +487,17 @@ class KVStorageManager(TransferQueueStorageManager):
         assert self._multi_threads_executor is not None
         return self._multi_threads_executor
 
-    def _merge_tensors_to_tensordict(self, metadata: BatchMeta, values: list[Tensor]) -> TensorDict:
+    def _merge_tensors_to_tensordict(self, metadata: BatchMeta, values: list[Any]) -> TensorDict:
         """
         Reconstruct a TensorDict from a list of values using metadata.
         The values list is assumed to be in the same order as keys generated by `_generate_keys`.
         According to field names and global indexes in metadata, this method can determine
-        which dict key and which row this tensor belongs to. Then it reshapes the flat tensors list
+        which dict key and which row this value belongs to. Then it reshapes the flat values list
         back into a structured TensorDict .
 
         Args:
             metadata (BatchMeta): Metadata containing global indexes and field names.
-            values (list[Tensor]): List of tensors in field-major order.
+            values (list[Any]): List of values in field-major order.
         Returns:
             TensorDict: Reconstructed tensor dictionary with batch size equal to number of samples.
         """
@@ -545,7 +564,9 @@ class KVStorageManager(TransferQueueStorageManager):
         return TensorDict(merged_data, batch_size=num_samples)
 
     @staticmethod
-    def _get_shape_type_custom_backend_meta_list(metadata: BatchMeta):
+    def _get_shape_type_custom_backend_meta_list(
+        metadata: BatchMeta,
+    ) -> tuple[list[torch.Size], list[torch.dtype], list[Any]]:
         """
         Extract the expected shape, dtype, and custom_backend_meta for each field-sample pair in metadata.
         The order matches the key/value order: sorted by field name, then by global index.
@@ -573,7 +594,7 @@ class KVStorageManager(TransferQueueStorageManager):
         return shapes, dtypes, custom_backend_meta_list
 
     async def put_data(
-        self, data: TensorDict, metadata: BatchMeta, data_parser: Optional[Callable[[Any], Any]] = None
+        self, data: TensorDict, metadata: BatchMeta, data_parser: Callable[[Any], Any] | None = None
     ) -> None:
         """
         Store tensor data in the backend storage and notify the controller.

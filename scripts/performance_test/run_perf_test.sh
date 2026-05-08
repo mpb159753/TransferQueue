@@ -18,9 +18,6 @@ NUM_TEST_ITERATIONS="${NUM_TEST_ITERATIONS:-4}"
 USE_COMPLEX_CASE="${USE_COMPLEX_CASE:-false}"
 # ========================================
 
-# Backends to test (passed via --backend to perftest.py)
-BACKENDS=("SimpleStorage" "Yuanrong" "MooncakeStore")
-
 # Test settings: global_batch_size, field_num, seq_len, name
 declare -a SETTINGS=(
     "1024,9,8192,Small"
@@ -36,7 +33,44 @@ else
 fi
 
 # ---- TransferQueue perftest ----
-for backend in "${BACKENDS[@]}"; do
+
+# SimpleStorage (no compression) — baseline for SimpleStorage transport
+for setting in "${SETTINGS[@]}"; do
+    IFS=',' read -r batch_size field_num seq_len name <<< "$setting"
+    output_csv="${RESULTS_DIR}/simplestorage_${name,,}.csv"
+
+    echo "  SimpleStorage-nocompress: ${name} (batch=${batch_size}, fields=${field_num}, seq=${seq_len})"
+
+    TQ_COMPRESSION_ALGORITHM=none python "${PERFTEST_PY}" --backend_config="${CONFIG_YAML}" --backend=SimpleStorage \
+        --device="${DEVICE}" \
+        --global_batch_size="${batch_size}" --field_num="${field_num}" --seq_len="${seq_len}" \
+        --num_test_iterations="${NUM_TEST_ITERATIONS}" \
+        --head_node_ip="${HEAD_NODE_IP}" --worker_node_ip="${WORKER_NODE_IP}" \
+        --output_csv="${output_csv}" \
+        ${COMPLEX_FLAG}
+
+    sleep 10
+done
+
+# SimpleStorage (zstd compression) — compression comparison
+for setting in "${SETTINGS[@]}"; do
+    IFS=',' read -r batch_size field_num seq_len name <<< "$setting"
+    output_csv="${RESULTS_DIR}/simplestorage_zstd_${name,,}.csv"
+
+    echo "  SimpleStorage-zstd: ${name} (batch=${batch_size}, fields=${field_num}, seq=${seq_len})"
+
+    TQ_COMPRESSION_ALGORITHM=zstd python "${PERFTEST_PY}" --backend_config="${CONFIG_YAML}" --backend=SimpleStorage \
+        --device="${DEVICE}" \
+        --global_batch_size="${batch_size}" --field_num="${field_num}" --seq_len="${seq_len}" \
+        --num_test_iterations="${NUM_TEST_ITERATIONS}" \
+        --head_node_ip="${HEAD_NODE_IP}" --worker_node_ip="${WORKER_NODE_IP}" \
+        --output_csv="${output_csv}" \
+        ${COMPLEX_FLAG}
+
+    sleep 10
+done
+
+for backend in "Yuanrong" "MooncakeStore"; do
     echo "=========================================="
     echo "Testing backend: ${backend}"
     echo "=========================================="
