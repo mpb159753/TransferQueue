@@ -24,6 +24,13 @@ backend:
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null
 
+    # Tensor compression config (SimpleStorage only).
+    # Controlled at runtime by TQ_COMPRESSION_ALGORITHM env var.
+    compression:
+      algorithm: none       # none | zstd | lz4
+      level: 3
+      min_bytes: 1024
+
   # For MooncakeStore:
   MooncakeStore:
     # Whether to let TQ automatically init metadata_server.

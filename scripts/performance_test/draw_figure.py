@@ -32,6 +32,8 @@ size_order = ["Small", "Medium", "Large"]
 # All normalization lives here so the shell script keeps simple lowercase names.
 BACKEND_DISPLAY_NAMES = {
     "simplestorage": "SimpleStorage",
+    "simplestorage_zstd": "SimpleStorage-zstd",
+    "simplestorage_lz4": "SimpleStorage-lz4",
     "yuanrong": "Yuanrong",
     "mooncakestore": "MooncakeStore",
     "ray_baseline": "Ray",
@@ -96,7 +98,14 @@ df["Bandwidth"] = df["total_gbit_per_sec"]
 df["Scenario"] = df["backend_parsed"]
 
 # Set backend display order: only include backends that actually exist in the data
-preferred_backend_order = ["Ray", "SimpleStorage", "Yuanrong", "MooncakeStore"]
+preferred_backend_order = [
+    "Ray",
+    "SimpleStorage",
+    "SimpleStorage-zstd",
+    "SimpleStorage-lz4",
+    "Yuanrong",
+    "MooncakeStore",
+]
 
 # Get actual backends present in the data, maintaining preferred order
 actual_backends = df["Scenario"].unique().tolist()
