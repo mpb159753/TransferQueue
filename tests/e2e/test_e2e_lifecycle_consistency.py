@@ -90,6 +90,7 @@ BACKEND_CONFIGS = {
 COMPRESSION_CONFIGS = {
     "none": {"algorithm": "none"},
     "zstd": {"algorithm": "zstd", "level": 3, "min_bytes": 256},
+    "lz4": {"algorithm": "lz4", "level": 1, "min_bytes": 256},
 }
 
 

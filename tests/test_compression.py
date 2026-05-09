@@ -149,3 +149,45 @@ def test_zstd_missing_raises_clear_error(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fake_import)
     with pytest.raises(ImportError, match="zstandard is required"):
         compressor.compress_bytes(b"hello")
+
+
+class TestLz4Roundtrip:
+    lz4 = pytest.importorskip("lz4")
+
+    @pytest.mark.parametrize("level", [1, 6, 9])
+    def test_roundtrip_random_bytes(self, level):
+        compressor = TensorCompressor(algorithm="lz4", level=level)
+        raw = torch.randn(1024, dtype=torch.float32).numpy().tobytes()
+        compressed = compressor.compress_bytes(raw)
+        assert compressor.decompress_bytes(compressed) == raw
+
+    def test_accepts_memoryview_input(self):
+        compressor = TensorCompressor(algorithm="lz4")
+        raw = torch.arange(2048, dtype=torch.int64).contiguous().view(torch.uint8).numpy()
+        compressed = compressor.compress_bytes(memoryview(raw))
+        roundtripped = compressor.decompress_bytes(memoryview(compressed))
+        assert roundtripped == bytes(raw)
+
+    def test_lz4_enabled_properties(self):
+        compressor = TensorCompressor(algorithm="lz4", level=5, min_bytes=512)
+        assert compressor.algorithm == "lz4"
+        assert compressor.level == 5
+        assert compressor.min_bytes == 512
+        assert compressor.enabled is True
+
+
+def test_lz4_missing_raises_clear_error(monkeypatch):
+    """If lz4 is not installed, manager-time backend resolution raises a clear ImportError."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "lz4.frame":
+            raise ImportError("simulated missing lz4")
+        return real_import(name, *args, **kwargs)
+
+    compressor = TensorCompressor(algorithm="lz4")
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(ImportError, match="lz4 is required"):
+        compressor.compress_bytes(b"hello")

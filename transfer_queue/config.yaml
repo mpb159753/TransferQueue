@@ -26,9 +26,9 @@ backend:
     # Optional per-row tensor compression on the manager <-> storage-unit path.
     # The storage unit never invokes the compression backend itself.
     compression:
-      # "none" disables compression (default). Set to "zstd" to enable.
+      # "none" disables compression (default). Set to "zstd" or "lz4" to enable.
       algorithm: none
-      # zstd level (1-22). Ignored when algorithm == "none".
+      # zstd level (1-22) or lz4 level (1-16). Ignored when algorithm == "none".
       level: 3
       # Skip rows whose per-row payload (bytes) is below this threshold.
       min_bytes: 1024

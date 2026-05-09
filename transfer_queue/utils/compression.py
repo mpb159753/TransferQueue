@@ -28,7 +28,7 @@ import torch
 
 BytesLike: TypeAlias = bytes | bytearray | memoryview
 
-_SUPPORTED_ALGORITHMS = frozenset({"none", "zstd"})
+_SUPPORTED_ALGORITHMS = frozenset({"none", "zstd", "lz4"})
 
 
 class CompressedTensor:
@@ -89,8 +89,9 @@ class TensorCompressor:
         """Configure a compressor.
 
         Args:
-            algorithm: ``"none"`` disables compression; ``"zstd"`` uses zstandard.
-            level: Compression level (zstd: 1-22).
+            algorithm: ``"none"`` disables compression; ``"zstd"`` uses zstandard,
+                ``"lz4"`` uses LZ4.
+            level: Compression level (zstd: 1-22, lz4: 1-16).
             min_bytes: Skip rows whose per-row payload is smaller than this.
         """
         if algorithm not in _SUPPORTED_ALGORITHMS:
@@ -140,6 +141,22 @@ class TensorCompressor:
 
             def _decompress(compressed: BytesLike) -> bytes:
                 return zstd.decompress(compressed)
+
+            self._backend = (_compress, _decompress)
+            return self._backend
+        if self._algorithm == "lz4":
+            try:
+                import lz4.frame  # noqa: F811
+            except ImportError as e:
+                raise ImportError(
+                    "lz4 is required for compression='lz4'. Install with: pip install 'transfer_queue[compression]'"
+                ) from e
+
+            def _compress(raw: BytesLike, level: int) -> bytes:
+                return lz4.frame.compress(raw, compression_level=level)
+
+            def _decompress(compressed: BytesLike) -> bytes:
+                return lz4.frame.decompress(compressed)
 
             self._backend = (_compress, _decompress)
             return self._backend
