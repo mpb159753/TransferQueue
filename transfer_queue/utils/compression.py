@@ -173,8 +173,8 @@ class TensorCompressor:
 
 
 def _identity_compress(raw: BytesLike, level: int) -> bytes:
-    return bytes(raw)
+    return raw
 
 
 def _identity_decompress(compressed: BytesLike) -> bytes:
-    return bytes(compressed)
+    return compressed
