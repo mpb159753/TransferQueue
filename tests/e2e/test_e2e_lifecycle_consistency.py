@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import sys
 import time
@@ -149,6 +150,55 @@ def e2e_client(ray_cluster, backend_name, compression_name):
     transfer_queue.close()
 
 
+@pytest.fixture(scope="function")
+def replay_e2e_client(monkeypatch, tmp_path):
+    """Create a fresh SimpleStorage client with replay enabled before Ray actors start."""
+    if ray.is_initialized():
+        ray.shutdown()
+
+    replay_env = {
+        "TQ_REPLAY_DIR": str(tmp_path),
+        "TQ_REPLAY_BUF_SIZE": "1",
+        "TQ_COMPRESSION_ALGORITHM": "none",
+    }
+    for key, value in replay_env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("TQ_REPLAY_DUMP_DATA", raising=False)
+    monkeypatch.delenv("TQ_REPLAY_DUMP_MAX_BYTES", raising=False)
+    monkeypatch.delenv("TQ_REPLAY_RECORD_WIRE", raising=False)
+
+    ray.init(
+        ignore_reinit_error=True,
+        runtime_env={"env_vars": replay_env},
+        log_to_driver=True,
+    )
+
+    import transfer_queue
+
+    config = OmegaConf.create(
+        {
+            "controller": {
+                "polling_mode": True,
+            },
+            "backend": {
+                "storage_backend": "SimpleStorage",
+                "SimpleStorage": {
+                    "total_storage_size": 20,
+                    "num_data_storage_units": 1,
+                },
+            },
+        }
+    )
+    transfer_queue.init(config)
+
+    try:
+        yield transfer_queue.get_client(), tmp_path
+    finally:
+        transfer_queue.close()
+        if ray.is_initialized():
+            ray.shutdown()
+
+
 def generate_complex_data(indices: list[int]) -> TensorDict:
     """Generate complex TensorDict with all supported field types."""
     n = len(indices)
@@ -246,6 +296,25 @@ def poll_for_meta(client, partition_id, data_fields, batch_size, task_name, mode
             return meta
         time.sleep(0.3)
     return None
+
+
+def _read_replay_events(replay_dir):
+    events_path = replay_dir / "events.jsonl"
+    if not events_path.exists():
+        return []
+    return [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+
+
+def _poll_replay_events(replay_dir, expected_events: set[str], timeout_s: float = 5.0):
+    deadline = time.time() + timeout_s
+    events = []
+    while time.time() < deadline:
+        events = _read_replay_events(replay_dir)
+        event_names = {event.get("event") for event in events}
+        if expected_events.issubset(event_names):
+            return events
+        time.sleep(0.1)
+    return events
 
 
 # Helper Functions for Data Verification
@@ -359,6 +428,58 @@ def recover_local_index(global_index_order, new_global_index_order):
         local_index_order_to_recover.append(value_to_new_index[val])
 
     return local_index_order_to_recover
+
+
+def test_replay_raw_lifecycle(replay_e2e_client):
+    """Replay recording captures controller metadata and raw SimpleStorage data events."""
+    client, replay_dir = replay_e2e_client
+    partition_id = "test_replay_raw_lifecycle"
+    task_name = "replay_raw_lifecycle_task"
+    fields = ["tokens", "values"]
+    batch_size = 3
+    data = TensorDict(
+        {
+            "tokens": torch.arange(batch_size * 4, dtype=torch.float32).reshape(batch_size, 4),
+            "values": torch.arange(batch_size * 2, dtype=torch.int64).reshape(batch_size, 2),
+        },
+        batch_size=batch_size,
+    )
+
+    try:
+        put_meta = client.put(data=data, partition_id=partition_id)
+        assert put_meta.size == batch_size
+
+        fetched_meta = poll_for_meta(client, partition_id, fields, batch_size, task_name, mode="fetch")
+        assert fetched_meta is not None and fetched_meta.size == batch_size
+
+        retrieved = client.get_data(fetched_meta)
+        assert torch.allclose(retrieved["tokens"], data["tokens"])
+        assert torch.equal(retrieved["values"], data["values"])
+
+        client.clear_partition(partition_id)
+        events = _poll_replay_events(
+            replay_dir,
+            {"meta_insert", "meta_fetch", "put_raw", "get_raw", "partition_clear"},
+        )
+    finally:
+        try:
+            client.clear_partition(partition_id)
+        except Exception:
+            pass
+
+    event_names = {event.get("event") for event in events}
+    assert {"meta_insert", "meta_fetch", "put_raw", "get_raw", "partition_clear"}.issubset(event_names)
+
+    put_raw = next(event for event in events if event.get("event") == "put_raw")
+    get_raw = next(event for event in events if event.get("event") == "get_raw")
+    assert put_raw["pid"] == partition_id
+    assert get_raw["pid"] == partition_id
+    assert put_raw["indexes"] == put_meta.global_indexes
+    assert get_raw["indexes"] == fetched_meta.global_indexes
+    assert set(put_raw["fields"]) == set(fields)
+    assert set(get_raw["fields"]) == set(fields)
+    assert put_raw["raw_tensor_bytes"] > 0
+    assert get_raw["raw_tensor_bytes"] > 0
 
 
 # Scenario One: Core Read/Write Consistency

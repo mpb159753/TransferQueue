@@ -1292,3 +1292,67 @@ class TestCompressedFieldSerialization:
         assert serial_utils._decoder is original_decoder
         assert serial_utils._encoder.compressor is None
         assert serial_utils._decoder.compressor is None
+
+    def test_serialization_stats_count_compressed_tensor_payload_bytes(self):
+        from transfer_queue.utils import serial_utils
+
+        stats_cls = getattr(serial_utils, "SerializationStats", None)
+        assert stats_cls is not None
+
+        compressor = TensorCompressor(algorithm="zstd", level=3, min_bytes=1)
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
+        tensor = torch.zeros((4, 1024), dtype=torch.float32)
+
+        stats = stats_cls()
+        frames = encoder.encode(tensor, stats=stats)
+        recovered = decoder.decode(frames)
+
+        assert stats.raw_tensor_bytes == tensor.numel() * tensor.element_size()
+        assert 0 < stats.compressed_tensor_bytes < stats.raw_tensor_bytes
+        assert stats.serialization_fallback is False
+        assert isinstance(recovered, list)
+        assert len(recovered) == tensor.shape[0]
+        for index, row in enumerate(recovered):
+            assert torch.equal(row, tensor[index])
+
+    def test_zmq_message_serialize_accepts_serialization_stats(self):
+        from transfer_queue.utils import serial_utils
+        from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
+
+        stats_cls = getattr(serial_utils, "SerializationStats", None)
+        assert stats_cls is not None
+
+        compressor = TensorCompressor(algorithm="zstd", level=3, min_bytes=1)
+        encoder = MsgpackEncoder(compressor=compressor)
+        decoder = MsgpackDecoder(compressor=compressor)
+        tensor = torch.zeros((2, 512), dtype=torch.float32)
+        msg = ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_DATA,
+            sender_id="manager",
+            receiver_id="storage",
+            body={"data": {"x": tensor}},
+        )
+
+        stats = stats_cls()
+        frames = msg.serialize(encoder=encoder, stats=stats)
+        decoded = ZMQMessage.deserialize(frames, decoder=decoder)
+
+        assert stats.raw_tensor_bytes == tensor.numel() * tensor.element_size()
+        assert 0 < stats.compressed_tensor_bytes < stats.raw_tensor_bytes
+        for index, row in enumerate(decoded.body["data"]["x"]):
+            assert torch.equal(row, tensor[index])
+
+    def test_serialization_stats_mark_pickle_ext_without_compressed_bytes(self):
+        from transfer_queue.utils import serial_utils
+
+        stats_cls = getattr(serial_utils, "SerializationStats", None)
+        assert stats_cls is not None
+
+        encoder = MsgpackEncoder()
+        stats = stats_cls()
+        frames = encoder.encode(np.array(["a", "b"], dtype=object), stats=stats)
+
+        assert len(frames) == 1
+        assert stats.serialization_fallback is True
+        assert stats.compressed_tensor_bytes is None

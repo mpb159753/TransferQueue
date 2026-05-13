@@ -21,6 +21,9 @@ import pickle
 import warnings
 from collections.abc import Sequence
 from contextvars import ContextVar
+from dataclasses import dataclass
+from functools import reduce
+from operator import mul
 from typing import Any, TypeAlias
 
 import cloudpickle
@@ -51,10 +54,45 @@ logger = get_logger(__name__)
 # the tensors are writable to users.
 warnings.filterwarnings(action="ignore", message=r"The given buffer is not writable*", category=UserWarning)
 
+
+def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    return int(tensor.numel() * tensor.element_size())
+
+
+def _compressed_tensor_raw_nbytes(ct: CompressedTensor) -> int | None:
+    try:
+        torch_dtype = getattr(torch, ct.dtype)
+        item_size = torch.empty((), dtype=torch_dtype).element_size()
+        return int(reduce(mul, ct.shape, 1) * item_size)
+    except (AttributeError, TypeError, RuntimeError):
+        return None
+
+
 # ContextVar for thread/coroutine-safe buffer storage during serialization/deserialization
 # This enables the global _encoder/_decoder instances to be safely used across threads
 _encoder_aux_buffers: ContextVar[list[bytestr] | None] = ContextVar("encoder_aux_buffers", default=None)
 _decoder_aux_buffers: ContextVar[Sequence[bytestr] | None] = ContextVar("decoder_aux_buffers", default=None)
+_encoder_stats: ContextVar["SerializationStats | None"] = ContextVar("encoder_stats", default=None)
+
+
+@dataclass
+class SerializationStats:
+    """Optional serialization telemetry for replay wire metrics."""
+
+    raw_tensor_bytes: int = 0
+    compressed_tensor_bytes: int | None = 0
+    serialization_fallback: bool = False
+
+    def add_raw_tensor(self, nbytes: int) -> None:
+        self.raw_tensor_bytes += int(nbytes)
+
+    def add_compressed_tensor(self, nbytes: int) -> None:
+        if self.compressed_tensor_bytes is not None:
+            self.compressed_tensor_bytes += int(nbytes)
+
+    def mark_fallback(self) -> None:
+        self.serialization_fallback = True
+        self.compressed_tensor_bytes = None
 
 
 class MsgpackEncoder:
@@ -78,11 +116,12 @@ class MsgpackEncoder:
         assert buffers is not None, "aux_buffers accessed outside of encode() context"
         return buffers
 
-    def encode(self, obj: Any) -> Sequence[bytestr]:
+    def encode(self, obj: Any, stats: SerializationStats | None = None) -> Sequence[bytestr]:
         """Encode a given object to a byte array."""
 
         bufs: list[bytestr] = [b""]
         token = _encoder_aux_buffers.set(bufs)
+        stats_token = _encoder_stats.set(stats)
         try:
             bufs[0] = self.encoder.encode(obj)
             # This `bufs` list allows us to collect direct pointers to backing
@@ -91,7 +130,13 @@ class MsgpackEncoder:
             # new buffer.
             return bufs
         finally:
+            _encoder_stats.reset(stats_token)
             _encoder_aux_buffers.reset(token)
+
+    @property
+    def stats(self) -> SerializationStats | None:
+        """Get optional stats for the current encode context."""
+        return _encoder_stats.get()
 
     def enc_hook(self, obj: Any) -> Any:
         """Custom encoding hook for types msgspec doesn't natively support.
@@ -121,6 +166,7 @@ class MsgpackEncoder:
                     # Fallback to pickle for platforms that don't support the view
                     pass
             # Only true object arrays (or structured dtypes with object fields) reach here
+            self._mark_serialization_fallback()
             return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
 
         if callable(obj):
@@ -129,7 +175,23 @@ class MsgpackEncoder:
             return msgpack.Ext(CUSTOM_TYPE_CLOUDPICKLE, cloudpickle.dumps(obj))
 
         # Fallback to pickle for unknown types
+        self._mark_serialization_fallback()
         return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
+
+    def _mark_serialization_fallback(self) -> None:
+        stats = self.stats
+        if stats is not None:
+            stats.mark_fallback()
+
+    def _record_raw_tensor(self, tensor: torch.Tensor) -> None:
+        stats = self.stats
+        if stats is not None:
+            stats.add_raw_tensor(_tensor_nbytes(tensor))
+
+    def _record_compressed_tensor(self, nbytes: int) -> None:
+        stats = self.stats
+        if stats is not None:
+            stats.add_compressed_tensor(nbytes)
 
     def _encode_tensordict(self, obj: Any) -> dict:
         """Convert TensorDict to a dict structure for recursive msgpack processing.
@@ -193,6 +255,8 @@ class MsgpackEncoder:
         if obj.device.type != "cpu":
             obj = obj.cpu()
 
+        self._record_raw_tensor(obj)
+
         # Zero-copy buffer extraction via uint8 view
         arr = obj.flatten().view(torch.uint8).numpy()
         buf = memoryview(arr)
@@ -206,6 +270,7 @@ class MsgpackEncoder:
         """Encode a regular (non-nested) tensor with zero-copy."""
         if obj.is_sparse:
             # Sparse tensors fallback to pickle
+            self._mark_serialization_fallback()
             return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
 
         if self.compressor is not None and self.compressor.should_compress_field(obj):
@@ -219,6 +284,8 @@ class MsgpackEncoder:
         # Handle GPU tensors
         if obj.device.type != "cpu":
             obj = obj.cpu()
+
+        self._record_raw_tensor(obj)
 
         # Note: view(uint8) is a byte-level view, NOT a value conversion.
         arr = obj.flatten().view(torch.uint8).numpy()
@@ -250,6 +317,8 @@ class MsgpackEncoder:
         for row in tensor:
             row_view = memoryview(row.flatten().view(torch.uint8).numpy())
             compressed = self.compressor.compress_bytes(row_view)
+            self._record_raw_tensor(row)
+            self._record_compressed_tensor(len(compressed))
             idx = len(self.aux_buffers)
             self.aux_buffers.append(memoryview(compressed))
             meta = (dtype, row_shape, idx, self.compressor.algorithm)
@@ -260,6 +329,12 @@ class MsgpackEncoder:
 
     def _encode_compressed_tensor(self, ct: CompressedTensor) -> msgpack.Ext:
         """Forward a ``CompressedTensor`` as ``Ext(6)`` — SU-side GET path, no zstd."""
+        raw_nbytes = _compressed_tensor_raw_nbytes(ct)
+        if raw_nbytes is not None:
+            stats = self.stats
+            if stats is not None:
+                stats.add_raw_tensor(raw_nbytes)
+        self._record_compressed_tensor(len(ct.data))
         idx = len(self.aux_buffers)
         self.aux_buffers.append(memoryview(ct.data))
         meta = (ct.dtype, ct.shape, idx, ct.algorithm)
@@ -440,7 +515,11 @@ _encoder = MsgpackEncoder()
 _decoder = MsgpackDecoder()
 
 
-def encode(obj: Any, encoder: MsgpackEncoder | None = None) -> list[bytestr]:
+def encode(
+    obj: Any,
+    encoder: MsgpackEncoder | None = None,
+    stats: SerializationStats | None = None,
+) -> list[bytestr]:
     """Encode an object via msgpack zero-copy; falls back to pickle on failure.
 
     The pickle path is a normal degradation path (e.g. body contains torch.dtype
@@ -449,12 +528,14 @@ def encode(obj: Any, encoder: MsgpackEncoder | None = None) -> list[bytestr]:
     """
     enc = encoder if encoder is not None else _encoder
     try:
-        return list(enc.encode(obj))
+        return list(enc.encode(obj, stats=stats))
     except (TypeError, ValueError) as e:
         logger.debug(
             "encode: msgpack failed (%s), falling back to pickle.",
             type(e).__name__,
         )
+        if stats is not None:
+            stats.mark_fallback()
         return [_PICKLE_FALLBACK_SENTINEL, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)]
 
 

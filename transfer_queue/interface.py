@@ -357,6 +357,10 @@ def close():
 
     if _TQ_CONTROLLER:
         try:
+            ray.get(_TQ_CONTROLLER.flush_replay.remote())
+        except Exception:
+            pass
+        try:
             ray.kill(_TQ_CONTROLLER)
         except Exception:
             pass
