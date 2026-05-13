@@ -38,6 +38,7 @@ from transfer_queue.sampler import BaseSampler, SequentialSampler
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
+from transfer_queue.utils.replay_recorder import ReplayRecorder
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -997,6 +998,7 @@ class TransferQueueController:
             )
 
         self.controller_id = f"TQ_CONTROLLER_{uuid4().hex[:8]}"
+        self.replay_recorder = ReplayRecorder.from_env(role="controller", component_id=self.controller_id)
         self.polling_mode = polling_mode
         self.tq_config = None  # global config for TransferQueue system
 
@@ -1018,6 +1020,30 @@ class TransferQueueController:
         self._start_process_request()
 
         logger.info(f"TransferQueue Controller {self.controller_id} initialized")
+
+    def _record_replay_event(self, event: str, payload: dict[str, Any]) -> None:
+        recorder = getattr(self, "replay_recorder", None)
+        if recorder is None:
+            return
+
+        try:
+            recorder.record_event(event, payload)
+        except Exception as exc:
+            logger.warning("[%s]: Failed to record replay event %s: %s", self.controller_id, event, exc)
+
+    def flush_replay(self) -> None:
+        recorder = getattr(self, "replay_recorder", None)
+        if recorder is None:
+            return
+
+        try:
+            recorder.flush()
+        except Exception as exc:
+            logger.warning("[%s]: Failed to flush replay recorder: %s", self.controller_id, exc)
+
+    @staticmethod
+    def _replay_elapsed_ms(start_ts: float) -> float:
+        return (time.time() - start_ts) * 1000
 
     # ==================== Partition Management API ====================
     def create_partition(self, partition_id: str) -> bool:
@@ -1178,7 +1204,12 @@ class TransferQueueController:
 
         return partition.get_production_status_for_fields(data_fields, mask=True)
 
-    def set_custom_meta(self, partition_custom_meta: dict[str, dict[int, dict]]) -> None:
+    def set_custom_meta(
+        self,
+        partition_custom_meta: dict[str, dict[int, dict]],
+        *,
+        _replay_sender: str = "direct",
+    ) -> None:
         """
         Set custom_meta for samples in partitions.
 
@@ -1211,6 +1242,16 @@ class TransferQueueController:
             partition = self._get_partition(partition_id)
             if partition:
                 partition.set_custom_meta(custom_meta)
+                applied_indexes = [global_index for global_index, meta in custom_meta.items() if meta]
+                if applied_indexes:
+                    self._record_replay_event(
+                        "custom_meta_set",
+                        {
+                            "pid": partition_id,
+                            "indexes": applied_indexes,
+                            "sender": _replay_sender,
+                        },
+                    )
             else:
                 logger.warning(
                     f"set_custom_meta: partition {partition_id}' not found; "
@@ -1226,6 +1267,8 @@ class TransferQueueController:
         batch_size: int | None = None,
         sampling_config: dict[str, Any] | None = None,
         *args,
+        _replay_sender: str = "direct",
+        _replay_start_ts: float | None = None,
         **kwargs,
     ) -> BatchMeta:
         """
@@ -1250,6 +1293,8 @@ class TransferQueueController:
         Raises:
             TimeoutError: If waiting for sufficient data times out in fetch mode
         """
+
+        replay_start_ts = _replay_start_ts if _replay_start_ts is not None else time.time()
 
         if mode == "insert":
             if partition_id not in self.partitions:
@@ -1277,7 +1322,19 @@ class TransferQueueController:
             # register global_indexes in partition
             partition.global_indexes.update(batch_global_indexes)
 
-            return self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
+            metadata = self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
+            self._record_replay_event(
+                "meta_insert",
+                {
+                    "pid": partition_id,
+                    "fields": list(data_fields or []),
+                    "indexes": list(metadata.global_indexes),
+                    "batch_size": metadata.size,
+                    "sender": _replay_sender,
+                    "elapsed_ms": self._replay_elapsed_ms(replay_start_ts),
+                },
+            )
+            return metadata
 
         if mode == "fetch":
             assert task_name is not None
@@ -1303,6 +1360,19 @@ class TransferQueueController:
                                 f"partition {partition_id}. Required: {batch_size}, "
                                 f"Available: {len(ready_for_consume_indexes)}."
                                 f" Returning None due to polling mode."
+                            )
+                            self._record_replay_event(
+                                "meta_fetch",
+                                {
+                                    "pid": partition_id,
+                                    "task": task_name,
+                                    "fields": list(data_fields or []),
+                                    "sampled": [],
+                                    "consumed": [],
+                                    "empty": True,
+                                    "sender": _replay_sender,
+                                    "elapsed_ms": self._replay_elapsed_ms(replay_start_ts),
+                                },
                             )
                             return BatchMeta.empty()
                     else:
@@ -1334,6 +1404,19 @@ class TransferQueueController:
             # batches per DP rank, so we only check for empty results.
             if len(batch_global_indexes) == 0:
                 if self.polling_mode:
+                    self._record_replay_event(
+                        "meta_fetch",
+                        {
+                            "pid": partition_id,
+                            "task": task_name,
+                            "fields": list(data_fields or []),
+                            "sampled": [],
+                            "consumed": [],
+                            "empty": True,
+                            "sender": _replay_sender,
+                            "elapsed_ms": self._replay_elapsed_ms(replay_start_ts),
+                        },
+                    )
                     return BatchMeta.empty()
                 raise RuntimeError(
                     f"Sampler returned no samples. Please check the sampler logic. "
@@ -1352,6 +1435,33 @@ class TransferQueueController:
 
         # Package into metadata
         metadata = self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
+
+        if mode == "fetch":
+            self._record_replay_event(
+                "meta_fetch",
+                {
+                    "pid": partition_id,
+                    "task": task_name,
+                    "fields": list(data_fields or []),
+                    "sampled": list(batch_global_indexes),
+                    "consumed": list(consumed_indexes),
+                    "empty": False,
+                    "sender": _replay_sender,
+                    "elapsed_ms": self._replay_elapsed_ms(replay_start_ts),
+                },
+            )
+        elif mode == "force_fetch":
+            self._record_replay_event(
+                "meta_force_fetch",
+                {
+                    "pid": partition_id,
+                    "fields": list(data_fields or []),
+                    "indexes": list(metadata.global_indexes),
+                    "batch_size": metadata.size,
+                    "sender": _replay_sender,
+                    "elapsed_ms": self._replay_elapsed_ms(replay_start_ts),
+                },
+            )
 
         return metadata
 
@@ -1470,7 +1580,13 @@ class TransferQueueController:
         )
         return batch_meta
 
-    def clear_partition(self, partition_id: str, clear_consumption: bool = True):
+    def clear_partition(
+        self,
+        partition_id: str,
+        clear_consumption: bool = True,
+        *,
+        _replay_sender: str = "direct",
+    ):
         """
         Clear data for a specific partition (delete the whole partition).
 
@@ -1491,6 +1607,13 @@ class TransferQueueController:
         self.index_manager.release_partition(partition_id)
         self.partitions.pop(partition_id)
         self.sampler.clear_cache(partition_id)
+        self._record_replay_event(
+            "partition_clear",
+            {
+                "pid": partition_id,
+                "sender": _replay_sender,
+            },
+        )
 
     def reset_consumption(self, partition_id: str, task_name: str | None = None):
         """
@@ -1515,6 +1638,8 @@ class TransferQueueController:
         global_indexes: list[int],
         partition_ids: list[str],
         clear_consumption: bool = True,
+        *,
+        _replay_sender: str = "direct",
     ):
         """
         Clear meta for individual samples (preserving the partition).
@@ -1558,6 +1683,14 @@ class TransferQueueController:
 
             # Release the specific indexes from index manager
             self.index_manager.release_indexes(partition_id, global_indexes_to_clear)
+            self._record_replay_event(
+                "meta_clear",
+                {
+                    "pid": partition_id,
+                    "indexes": global_indexes_to_clear,
+                    "sender": _replay_sender,
+                },
+            )
 
     def kv_retrieve_meta(
         self,
@@ -1808,6 +1941,7 @@ class TransferQueueController:
             if request_msg.request_type == ZMQRequestType.GET_META:
                 with perf_monitor.measure(op_type="GET_META"):
                     params = request_msg.body
+                    replay_start_ts = time.time()
 
                     metadata = self.get_metadata(
                         data_fields=params["data_fields"],
@@ -1816,6 +1950,8 @@ class TransferQueueController:
                         mode=params.get("mode", "fetch"),
                         task_name=params.get("task_name"),
                         sampling_config=params.get("sampling_config", {}),
+                        _replay_sender=request_msg.sender_id,
+                        _replay_start_ts=replay_start_ts,
                     )
 
                     response_msg = ZMQMessage.create(
@@ -1828,6 +1964,7 @@ class TransferQueueController:
             elif request_msg.request_type == ZMQRequestType.GET_PARTITION_META:
                 with perf_monitor.measure(op_type="GET_PARTITION_META"):
                     params = request_msg.body
+                    replay_start_ts = time.time()
                     partition_id = params["partition_id"]
                     partition = self._get_partition(partition_id)
                     if partition is not None:
@@ -1837,6 +1974,8 @@ class TransferQueueController:
                             data_fields=partition_data_fields,
                             partition_id=partition_id,
                             mode="force_fetch",
+                            _replay_sender=request_msg.sender_id,
+                            _replay_start_ts=replay_start_ts,
                         )
                     else:
                         metadata = None
@@ -1852,7 +1991,10 @@ class TransferQueueController:
                     params = request_msg.body
                     partition_custom_meta = params["partition_custom_meta"]
 
-                    self.set_custom_meta(partition_custom_meta=partition_custom_meta)
+                    self.set_custom_meta(
+                        partition_custom_meta=partition_custom_meta,
+                        _replay_sender=request_msg.sender_id,
+                    )
 
                     response_msg = ZMQMessage.create(
                         request_type=ZMQRequestType.SET_CUSTOM_META_RESPONSE,
@@ -1867,7 +2009,7 @@ class TransferQueueController:
                     global_indexes = params["global_indexes"]
                     partition_ids = params["partition_ids"]
 
-                    self.clear_meta(global_indexes, partition_ids)
+                    self.clear_meta(global_indexes, partition_ids, _replay_sender=request_msg.sender_id)
 
                     response_msg = ZMQMessage.create(
                         request_type=ZMQRequestType.CLEAR_META_RESPONSE,
@@ -1881,7 +2023,7 @@ class TransferQueueController:
                     params = request_msg.body
                     partition_id = params["partition_id"]
 
-                    self.clear_partition(partition_id)
+                    self.clear_partition(partition_id, _replay_sender=request_msg.sender_id)
                     response_msg = ZMQMessage.create(
                         request_type=ZMQRequestType.CLEAR_PARTITION_RESPONSE,
                         sender_id=self.controller_id,

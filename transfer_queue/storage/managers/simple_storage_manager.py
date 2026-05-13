@@ -15,6 +15,7 @@
 
 import asyncio
 import os
+import time
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping
@@ -28,11 +29,15 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
+from transfer_queue.utils.compression import TensorCompressor
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.replay_recorder import ReplayRecorder
+from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder, SerializationStats
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
+    multipart_nbytes,
     with_zmq_socket,
 )
 
@@ -85,6 +90,33 @@ class AsyncSimpleStorageManager(StorageManager):
 
         self.storage_unit_infos = self._register_servers(server_infos)
 
+        self.compressor = self._build_compressor(config)
+        # Per-instance encoder/decoder so colocated SU keeps using uncompressed defaults.
+        self._encoder = MsgpackEncoder(compressor=self.compressor)
+        self._decoder = MsgpackDecoder(compressor=self.compressor)
+        if self.compressor is not None and self.compressor.enabled:
+            logger.info(
+                "SimpleStorage tensor compression enabled: algorithm=%s, level=%d, min_bytes=%d",
+                self.compressor.algorithm,
+                self.compressor.level,
+                self.compressor.min_bytes,
+            )
+        self._replay_recorder = ReplayRecorder.from_env(
+            role="storage_manager",
+            component_id=self.storage_manager_id,
+        )
+
+    @staticmethod
+    def _build_compressor(config: DictConfig) -> TensorCompressor | None:
+        """Build a ``TensorCompressor`` from config + env, or return ``None`` when disabled."""
+        compression_cfg = config.get("compression", {}) or {}
+        algorithm = os.environ.get("TQ_COMPRESSION_ALGORITHM", compression_cfg.get("algorithm", "none"))
+        if algorithm == "none":
+            return None
+        level = int(os.environ.get("TQ_COMPRESSION_LEVEL", compression_cfg.get("level", 3)))
+        min_bytes = int(os.environ.get("TQ_COMPRESSION_MIN_BYTES", compression_cfg.get("min_bytes", 1024)))
+        return TensorCompressor(algorithm=algorithm, level=level, min_bytes=min_bytes)
+
     def _register_servers(self, server_infos: "ZMQServerInfo | dict[Any, ZMQServerInfo]"):
         """Register and validate server information.
 
@@ -130,6 +162,210 @@ class AsyncSimpleStorageManager(StorageManager):
             gi_lists[key].append(global_idx)
             pos_lists[key].append(pos)
         return {key: RoutingGroup(gi_lists[key], pos_lists[key]) for key in gi_lists}
+
+    @staticmethod
+    def _group_positions_by_partition(metadata: BatchMeta) -> dict[str, list[int]]:
+        """Return batch positions grouped by partition id in first-seen order."""
+        partition_positions: dict[str, list[int]] = {}
+        for pos, partition_id in enumerate(metadata.partition_ids):
+            partition_positions.setdefault(str(partition_id), []).append(pos)
+        return partition_positions
+
+    @staticmethod
+    def _single_partition_id(metadata: BatchMeta, operation: str) -> str:
+        """Return the only partition id in metadata, or reject ambiguous routing context."""
+        partition_ids = {str(partition_id) for partition_id in metadata.partition_ids}
+        if len(partition_ids) != 1:
+            raise ValueError(
+                f"AsyncSimpleStorageManager.{operation} expects metadata from a single partition, "
+                f"got {sorted(partition_ids)}"
+            )
+        return next(iter(partition_ids))
+
+    @staticmethod
+    def _sum_replay_field_bytes(fields: dict[str, dict[str, Any]], key: str) -> int | None:
+        """Sum byte counts from field metadata, preserving unknown estimated totals."""
+        total = 0
+        saw_unknown = False
+        for info in fields.values():
+            value = info.get(key)
+            if value is None:
+                if key == "raw_estimated_bytes":
+                    saw_unknown = True
+                continue
+            total += int(value)
+        if key == "raw_estimated_bytes" and saw_unknown:
+            return None
+        return total
+
+    @staticmethod
+    def _field_schema_for_positions(
+        field_schema: dict[str, dict[str, Any]],
+        positions: list[int],
+    ) -> dict[str, dict[str, Any]]:
+        """Copy field schema and narrow per-sample shape metadata to selected rows."""
+        selected_schema: dict[str, dict[str, Any]] = {}
+        for field_name, field_meta in field_schema.items():
+            meta = field_meta.copy()
+            per_sample_shapes = meta.get("per_sample_shapes")
+            if isinstance(per_sample_shapes, list | tuple):
+                meta["per_sample_shapes"] = [per_sample_shapes[pos] for pos in positions]
+            selected_schema[field_name] = meta
+        return selected_schema
+
+    def _select_data_mapping_by_positions(
+        self,
+        data: Mapping[str, Any],
+        positions: list[int],
+    ) -> dict[str, Any]:
+        return {field: self._select_by_positions(value, positions) for field, value in data.items()}
+
+    @staticmethod
+    def _replay_dump_seq_from_path(dump_path) -> int | None:
+        seq_text = dump_path.stem.removeprefix("put_")
+        if not seq_text.isdigit():
+            return None
+        return int(seq_text)
+
+    def _dump_replay_put_batch(
+        self,
+        partition_id: str,
+        global_indexes: list[int],
+        fields: dict[str, Any],
+        field_schema: dict[str, dict[str, Any]],
+        raw_tensor_bytes: int | None,
+        raw_estimated_bytes: int | None,
+    ) -> tuple[str | None, str | None]:
+        recorder = getattr(self, "_replay_recorder", None)
+        if recorder is None or not recorder.should_dump(raw_estimated_bytes=raw_estimated_bytes):
+            return None, None
+
+        dump_path = recorder.make_dump_path(partition_id)
+        if dump_path is None:
+            return None, None
+
+        try:
+            payload = {
+                "partition_id": partition_id,
+                "global_indexes": global_indexes,
+                "fields": fields,
+                "field_schema": field_schema,
+                "timestamp": time.time(),
+                "batch_seq": self._replay_dump_seq_from_path(dump_path),
+                "raw_tensor_bytes": raw_tensor_bytes,
+            }
+            torch.save(payload, dump_path)
+            try:
+                return str(dump_path.relative_to(recorder.config.record_dir)), None
+            except ValueError:
+                return str(dump_path), None
+        except Exception as exc:  # pragma: no cover - defensive: replay must not fail training.
+            logger.warning("Failed to dump SimpleStorage replay batch for partition %r: %s", partition_id, exc)
+            return None, f"{type(exc).__name__}: {exc}"
+
+    def _record_raw_replay_event(
+        self,
+        event: str,
+        data: Mapping[str, Any],
+        metadata: BatchMeta,
+        elapsed_ms: float,
+        *,
+        field_schema: dict[str, dict[str, Any]] | None = None,
+        data_parser_stage: str | None = None,
+        dump_put_data: bool = False,
+    ) -> None:
+        recorder = getattr(self, "_replay_recorder", None)
+        if recorder is None:
+            return
+
+        try:
+            for partition_id, positions in self._group_positions_by_partition(metadata).items():
+                partition_indexes = [metadata.global_indexes[pos] for pos in positions]
+                partition_data = self._select_data_mapping_by_positions(data, positions)
+                partition_field_schema = (
+                    self._field_schema_for_positions(field_schema, positions) if field_schema is not None else None
+                )
+                fields = recorder.extract_fields_info(partition_data)
+                raw_tensor_bytes = self._sum_replay_field_bytes(fields, "raw_tensor_bytes")
+                raw_estimated_bytes = self._sum_replay_field_bytes(fields, "raw_estimated_bytes")
+                payload: dict[str, Any] = {
+                    "pid": partition_id,
+                    "partition_id": partition_id,
+                    "indexes": partition_indexes,
+                    "fields": fields,
+                    "raw_tensor_bytes": raw_tensor_bytes,
+                    "raw_estimated_bytes": raw_estimated_bytes,
+                    "elapsed_ms": elapsed_ms,
+                }
+
+                if data_parser_stage is not None:
+                    payload["data_parser_stage"] = data_parser_stage
+
+                if dump_put_data:
+                    dump_path, dump_error = self._dump_replay_put_batch(
+                        partition_id,
+                        partition_indexes,
+                        partition_data,
+                        partition_field_schema or {},
+                        raw_tensor_bytes,
+                        raw_estimated_bytes,
+                    )
+                    if dump_path is not None:
+                        payload["dump"] = dump_path
+                    if dump_error is not None:
+                        payload["dump_error"] = dump_error
+
+                recorder.record_event(event, payload)
+        except Exception as exc:  # pragma: no cover - defensive: replay must not fail training.
+            logger.warning("Failed to record SimpleStorage replay event %r: %s", event, exc)
+
+    def _should_record_wire_replay(self) -> bool:
+        recorder = getattr(self, "_replay_recorder", None)
+        return bool(recorder is not None and recorder.config.record_wire)
+
+    def _record_wire_replay_event(
+        self,
+        event: str,
+        *,
+        partition_id: str,
+        global_indexes: list[int],
+        target_storage_unit: str,
+        wire_frame_bytes: int,
+        elapsed_ms: float,
+        stats: SerializationStats | None = None,
+        data_parser_stage: str | None = None,
+    ) -> None:
+        recorder = getattr(self, "_replay_recorder", None)
+        if recorder is None or not recorder.config.record_wire:
+            return
+
+        try:
+            payload: dict[str, Any] = {
+                "pid": partition_id,
+                "partition_id": partition_id,
+                "target_storage_unit": target_storage_unit,
+                "indexes": list(global_indexes),
+                "wire_frame_bytes": int(wire_frame_bytes),
+                "elapsed_ms": elapsed_ms,
+            }
+
+            if event == "put_wire":
+                payload["compression_algorithm"] = self.compressor.algorithm if self.compressor is not None else "none"
+
+            if data_parser_stage is not None:
+                payload["data_parser_stage"] = data_parser_stage
+
+            if stats is not None:
+                if stats.raw_tensor_bytes:
+                    payload["raw_tensor_bytes"] = stats.raw_tensor_bytes
+                if stats.compressed_tensor_bytes is not None:
+                    payload["compressed_tensor_bytes"] = stats.compressed_tensor_bytes
+                if stats.serialization_fallback:
+                    payload["serialization_fallback"] = True
+
+            recorder.record_event(event, payload)
+        except Exception as exc:  # pragma: no cover - defensive: replay must not fail training.
+            logger.warning("Failed to record SimpleStorage wire replay event %r: %s", event, exc)
 
     @staticmethod
     def _select_by_positions(field_data, positions: list[int]):
@@ -236,11 +472,18 @@ class AsyncSimpleStorageManager(StorageManager):
 
         logger.debug(f"[{self.storage_manager_id}]: receive put_data request, putting {metadata.size} samples.")
 
+        if data_parser is not None and self.compressor is not None and self.compressor.enabled:
+            raise ValueError(
+                "data_parser is not supported when SimpleStorage tensor compression is enabled. "
+                "Disable compression (TQ_COMPRESSION_ALGORITHM=none) or omit the data_parser argument."
+            )
+
         batch_size = metadata.size
 
         if batch_size == 0:
             return
 
+        partition_id = self._single_partition_id(metadata, "put_data")
         field_schema = extract_field_schema(data)
 
         routing = self._group_by_hash(metadata.global_indexes)
@@ -249,11 +492,13 @@ class AsyncSimpleStorageManager(StorageManager):
                 group.global_indexes,
                 {f: self._select_by_positions(data[f], group.batch_positions) for f in data.keys()},
                 target_storage_unit=su_id,
+                partition_id=partition_id,
                 data_parser=data_parser,
             )
             for su_id, group in routing.items()
         ]
 
+        start_time = time.perf_counter()
         try:
             await asyncio.gather(*tasks)
         except Exception as e:
@@ -266,7 +511,17 @@ class AsyncSimpleStorageManager(StorageManager):
             )
             raise
 
-        partition_id = metadata.partition_ids[0]
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        self._record_raw_replay_event(
+            "put_raw",
+            data,
+            metadata,
+            elapsed_ms,
+            field_schema=field_schema,
+            data_parser_stage="before_storage_unit_parser" if data_parser is not None else "none",
+            dump_put_data=True,
+        )
+
         await self.notify_data_update(
             partition_id,
             metadata.global_indexes,
@@ -279,6 +534,7 @@ class AsyncSimpleStorageManager(StorageManager):
         global_indexes: list[int],
         storage_data: dict[str, Any],
         target_storage_unit: str,
+        partition_id: str,
         data_parser: Callable[[Any], Any] | None = None,
         socket: zmq.Socket = None,
     ):
@@ -294,10 +550,25 @@ class AsyncSimpleStorageManager(StorageManager):
         )
 
         try:
-            data = request_msg.serialize()
+            record_wire = self._should_record_wire_replay()
+            wire_stats = SerializationStats() if record_wire else None
+            start_time = time.perf_counter() if record_wire else 0.0
+            data = request_msg.serialize(encoder=self._encoder, stats=wire_stats)
             await socket.send_multipart(data, copy=False)
             messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
+            if record_wire:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                self._record_wire_replay_event(
+                    "put_wire",
+                    partition_id=partition_id,
+                    global_indexes=global_indexes,
+                    target_storage_unit=target_storage_unit,
+                    wire_frame_bytes=multipart_nbytes(data),
+                    elapsed_ms=elapsed_ms,
+                    stats=wire_stats,
+                    data_parser_stage="before_storage_unit_parser" if data_parser is not None else None,
+                )
+            response_msg = ZMQMessage.deserialize(messages, decoder=self._decoder)
 
             if response_msg.request_type != ZMQRequestType.PUT_DATA_RESPONSE:
                 raise RuntimeError(
@@ -389,12 +660,19 @@ class AsyncSimpleStorageManager(StorageManager):
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
 
+        partition_id = self._single_partition_id(metadata, "get_data")
         routing = self._group_by_hash(metadata.global_indexes)
 
         tasks = [
-            self._get_from_single_storage_unit(group.global_indexes, metadata.field_names, target_storage_unit=su_id)
+            self._get_from_single_storage_unit(
+                group.global_indexes,
+                metadata.field_names,
+                target_storage_unit=su_id,
+                partition_id=partition_id,
+            )
             for su_id, group in routing.items()
         ]
+        start_time = time.perf_counter()
         try:
             results = await asyncio.gather(*tasks)
         except Exception as e:
@@ -418,7 +696,10 @@ class AsyncSimpleStorageManager(StorageManager):
 
         tensor_data = {field: self._pack_field_values(v) for field, v in ordered_data.items()}
 
-        return TensorDict(tensor_data, batch_size=len(metadata))
+        result = TensorDict(tensor_data, batch_size=len(metadata))
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        self._record_raw_replay_event("get_raw", result, metadata, elapsed_ms)
+        return result
 
     @with_storage_unit_socket
     async def _get_from_single_storage_unit(
@@ -426,6 +707,7 @@ class AsyncSimpleStorageManager(StorageManager):
         global_indexes: list[int],
         fields: list[str],
         target_storage_unit: str,
+        partition_id: str,
         socket: zmq.Socket = None,
     ):
         """Get data from a single SU by global index keys."""
@@ -436,9 +718,21 @@ class AsyncSimpleStorageManager(StorageManager):
             body={"global_indexes": global_indexes, "fields": fields},
         )
         try:
-            await socket.send_multipart(request_msg.serialize())
+            record_wire = self._should_record_wire_replay()
+            start_time = time.perf_counter() if record_wire else 0.0
+            await socket.send_multipart(request_msg.serialize(encoder=self._encoder))
             messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
+            if record_wire:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                self._record_wire_replay_event(
+                    "get_wire",
+                    partition_id=partition_id,
+                    global_indexes=global_indexes,
+                    target_storage_unit=target_storage_unit,
+                    wire_frame_bytes=multipart_nbytes(messages),
+                    elapsed_ms=elapsed_ms,
+                )
+            response_msg = ZMQMessage.deserialize(messages, decoder=self._decoder)
 
             if response_msg.request_type == ZMQRequestType.GET_DATA_RESPONSE:
                 storage_unit_data = response_msg.body["data"]
@@ -502,9 +796,9 @@ class AsyncSimpleStorageManager(StorageManager):
                 body={"global_indexes": global_indexes},
             )
 
-            await socket.send_multipart(request_msg.serialize())
+            await socket.send_multipart(request_msg.serialize(encoder=self._encoder))
             messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
+            response_msg = ZMQMessage.deserialize(messages, decoder=self._decoder)
 
             if response_msg.request_type != ZMQRequestType.CLEAR_DATA_RESPONSE:
                 raise RuntimeError(
@@ -526,4 +820,7 @@ class AsyncSimpleStorageManager(StorageManager):
 
     def close(self) -> None:
         """Close all ZMQ sockets and context to prevent resource leaks."""
+        recorder = getattr(self, "_replay_recorder", None)
+        if recorder is not None:
+            recorder.close()
         super().close()

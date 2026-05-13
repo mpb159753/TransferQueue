@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 
 import pytest
 import ray
 import torch
 
+from transfer_queue import interface as tq_interface
+from transfer_queue.client import TransferQueueClient
 from transfer_queue.controller import TransferQueueController
 
 # Set up logging
@@ -41,7 +44,266 @@ def ray_setup():
         logger.info("Ray has been shut down completely after test")
 
 
+@pytest.fixture(scope="function")
+def replay_ray_setup(monkeypatch, tmp_path):
+    if ray.is_initialized():
+        ray.shutdown()
+
+    monkeypatch.setenv("TQ_REPLAY_DIR", str(tmp_path))
+    monkeypatch.setenv("TQ_REPLAY_BUF_SIZE", "1")
+    monkeypatch.delenv("TQ_REPLAY_DUMP_DATA", raising=False)
+    monkeypatch.delenv("TQ_REPLAY_DUMP_MAX_BYTES", raising=False)
+    monkeypatch.delenv("TQ_REPLAY_RECORD_WIRE", raising=False)
+
+    ray.init(
+        ignore_reinit_error=True,
+        runtime_env={
+            "env_vars": {
+                "RAY_DEBUG": "1",
+                "RAY_DEDUP_LOGS": "0",
+                "TQ_REPLAY_DIR": str(tmp_path),
+                "TQ_REPLAY_BUF_SIZE": "1",
+            }
+        },
+        log_to_driver=True,
+    )
+    yield tmp_path
+    if ray.is_initialized():
+        ray.shutdown()
+        logger.info("Ray has been shut down completely after replay test")
+
+
+def _read_replay_events(replay_dir):
+    events_path = replay_dir / "events.jsonl"
+    assert events_path.exists()
+    return [json.loads(line) for line in events_path.read_text().splitlines()]
+
+
+def _event_by_type(events, event_type):
+    matches = [event for event in events if event["event"] == event_type]
+    assert len(matches) == 1
+    return matches[0]
+
+
+class _FakeRemoteMethod:
+    def __init__(self, calls, name):
+        self._calls = calls
+        self._name = name
+
+    def remote(self):
+        self._calls.append(self._name)
+        return self._name
+
+
+class _FakeController:
+    def __init__(self, calls):
+        self.flush_replay = _FakeRemoteMethod(calls, "flush_replay")
+
+
 class TestTransferQueueController:
+    def test_controller_replay_records_direct_metadata_lifecycle(self, replay_ray_setup):
+        replay_dir = replay_ray_setup
+        partition_id = "replay_direct"
+        tq_controller = TransferQueueController.remote()
+
+        metadata = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=["input_ids"],
+                batch_size=2,
+                partition_id=partition_id,
+                mode="insert",
+            )
+        )
+        assert metadata.global_indexes == [0, 1]
+
+        success = ray.get(
+            tq_controller.update_production_status.remote(
+                partition_id=partition_id,
+                global_indexes=metadata.global_indexes,
+                field_schema={"input_ids": {"dtype": "torch.int64", "shape": (4,)}},
+            )
+        )
+        assert success
+
+        fetched = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=["input_ids"],
+                batch_size=2,
+                partition_id=partition_id,
+                mode="fetch",
+                task_name="generate_sequences",
+            )
+        )
+        assert fetched.global_indexes == [0, 1]
+
+        forced = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=["input_ids"],
+                partition_id=partition_id,
+                mode="force_fetch",
+            )
+        )
+        assert forced.global_indexes == [0, 1]
+
+        ray.get(
+            tq_controller.set_custom_meta.remote(partition_custom_meta={partition_id: {0: {}, 1: {"quality": "high"}}})
+        )
+        ray.get(tq_controller.set_custom_meta.remote(partition_custom_meta={partition_id: {0: {}, 1: {}}}))
+        ray.get(tq_controller.clear_meta.remote(global_indexes=[0], partition_ids=[partition_id]))
+        ray.get(tq_controller.clear_partition.remote(partition_id))
+
+        events = _read_replay_events(replay_dir)
+        assert [event["event"] for event in events] == [
+            "meta_insert",
+            "meta_fetch",
+            "meta_force_fetch",
+            "custom_meta_set",
+            "meta_clear",
+            "partition_clear",
+        ]
+
+        insert_event = _event_by_type(events, "meta_insert")
+        assert insert_event["pid"] == partition_id
+        assert insert_event["fields"] == ["input_ids"]
+        assert insert_event["indexes"] == [0, 1]
+        assert insert_event["batch_size"] == 2
+        assert insert_event["sender"] == "direct"
+        assert insert_event["role"] == "controller"
+        assert insert_event["elapsed_ms"] >= 0
+
+        fetch_event = _event_by_type(events, "meta_fetch")
+        assert fetch_event["task"] == "generate_sequences"
+        assert fetch_event["sampled"] == [0, 1]
+        assert fetch_event["consumed"] == [0, 1]
+        assert fetch_event["empty"] is False
+        assert fetch_event["sender"] == "direct"
+
+        force_fetch_event = _event_by_type(events, "meta_force_fetch")
+        assert force_fetch_event["indexes"] == [0, 1]
+        assert force_fetch_event["batch_size"] == 2
+        assert force_fetch_event["sender"] == "direct"
+
+        custom_event = _event_by_type(events, "custom_meta_set")
+        assert custom_event["pid"] == partition_id
+        assert custom_event["indexes"] == [1]
+        assert custom_event["sender"] == "direct"
+
+        clear_event = _event_by_type(events, "meta_clear")
+        assert clear_event["pid"] == partition_id
+        assert clear_event["indexes"] == [0]
+        assert clear_event["sender"] == "direct"
+
+        partition_clear_event = _event_by_type(events, "partition_clear")
+        assert partition_clear_event["pid"] == partition_id
+        assert partition_clear_event["sender"] == "direct"
+
+    def test_controller_replay_records_polling_empty_fetch(self, replay_ray_setup):
+        replay_dir = replay_ray_setup
+        partition_id = "replay_empty"
+        tq_controller = TransferQueueController.remote(polling_mode=True)
+
+        empty_meta = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=["input_ids"],
+                batch_size=1,
+                partition_id=partition_id,
+                mode="fetch",
+                task_name="generate_sequences",
+            )
+        )
+        assert empty_meta.size == 0
+
+        events = _read_replay_events(replay_dir)
+        assert [event["event"] for event in events] == ["meta_fetch"]
+        fetch_event = events[0]
+        assert fetch_event["pid"] == partition_id
+        assert fetch_event["fields"] == ["input_ids"]
+        assert fetch_event["sampled"] == []
+        assert fetch_event["consumed"] == []
+        assert fetch_event["empty"] is True
+        assert fetch_event["sender"] == "direct"
+
+    def test_controller_replay_records_zmq_request_sender(self, replay_ray_setup):
+        replay_dir = replay_ray_setup
+        partition_id = "replay_zmq"
+        tq_controller = TransferQueueController.remote()
+        controller_info = ray.get(tq_controller.get_zmq_server_info.remote())
+        client = TransferQueueClient(client_id="Client_12345", controller_info=controller_info)
+
+        try:
+            metadata = client.get_meta(
+                data_fields=["input_ids"],
+                batch_size=2,
+                partition_id=partition_id,
+                mode="insert",
+            )
+        finally:
+            client.close()
+
+        assert metadata.global_indexes == [0, 1]
+        events = _read_replay_events(replay_dir)
+        assert [event["event"] for event in events] == ["meta_insert"]
+        assert events[0]["pid"] == partition_id
+        assert events[0]["sender"] == "Client_12345"
+
+    def test_controller_replay_flushes_buffered_events(self, monkeypatch, tmp_path):
+        if ray.is_initialized():
+            ray.shutdown()
+
+        monkeypatch.setenv("TQ_REPLAY_DIR", str(tmp_path))
+        monkeypatch.setenv("TQ_REPLAY_BUF_SIZE", "2")
+        monkeypatch.delenv("TQ_REPLAY_DUMP_DATA", raising=False)
+        monkeypatch.delenv("TQ_REPLAY_DUMP_MAX_BYTES", raising=False)
+        monkeypatch.delenv("TQ_REPLAY_RECORD_WIRE", raising=False)
+
+        ray.init(
+            ignore_reinit_error=True,
+            runtime_env={
+                "env_vars": {
+                    "RAY_DEBUG": "1",
+                    "RAY_DEDUP_LOGS": "0",
+                    "TQ_REPLAY_DIR": str(tmp_path),
+                    "TQ_REPLAY_BUF_SIZE": "2",
+                }
+            },
+            log_to_driver=True,
+        )
+        try:
+            tq_controller = TransferQueueController.remote()
+            ray.get(
+                tq_controller.get_metadata.remote(
+                    data_fields=["input_ids"],
+                    batch_size=1,
+                    partition_id="replay_buffered",
+                    mode="insert",
+                )
+            )
+            assert not (tmp_path / "events.jsonl").exists()
+
+            ray.get(tq_controller.flush_replay.remote())
+
+            events = _read_replay_events(tmp_path)
+            assert [event["event"] for event in events] == ["meta_insert"]
+            assert events[0]["pid"] == "replay_buffered"
+        finally:
+            if ray.is_initialized():
+                ray.shutdown()
+
+    def test_interface_close_flushes_controller_replay_before_kill(self, monkeypatch):
+        calls = []
+        fake_controller = _FakeController(calls)
+
+        monkeypatch.setattr(tq_interface, "_TQ_STORAGE", None)
+        monkeypatch.setattr(tq_interface, "_TQ_CLIENT", None)
+        monkeypatch.setattr(tq_interface, "_TQ_CONTROLLER", fake_controller)
+        monkeypatch.setattr(tq_interface.ray, "get", lambda ref: ref)
+        monkeypatch.setattr(tq_interface.ray, "kill", lambda actor: calls.append("kill"))
+
+        tq_interface.close()
+
+        assert calls == ["flush_replay", "kill"]
+        assert tq_interface._TQ_CONTROLLER is None
+
     def test_controller_with_single_partition(self, ray_setup):
         gbs = 8
         num_n_samples = 4
